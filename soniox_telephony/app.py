@@ -300,10 +300,11 @@ class Leg:
                     log.error("Soniox TTS error leg=%s code=%s msg=%s", self.name, data.get("error_code"), data.get("error_message"))
                     continue
                 audio_b64 = data.get("audio")
-                if audio_b64 and self.twilio_ws and self.stream_sid:
-                    await self.twilio_ws.send_json({
+                destination = self.session.legs[self.session.other_leg(self.name)]
+                if audio_b64 and destination.twilio_ws and destination.stream_sid:
+                    await destination.twilio_ws.send_json({
                         "event": "media",
-                        "streamSid": self.stream_sid,
+                        "streamSid": destination.stream_sid,
                         "media": {"payload": audio_b64},
                     })
                 if data.get("terminated"):
@@ -557,7 +558,6 @@ async def twilio_stream(ws: WebSocket, session_id: str, leg: str) -> None:
     except Exception:
         log.exception("Twilio WS error session=%s leg=%s", session_id, leg)
     finally:
-        current.closed = True
         try:
             await current.close()
         except Exception:
