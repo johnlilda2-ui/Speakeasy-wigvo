@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from twilio.rest import Client
 from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import VoiceResponse
+from browser_test import register_browser_route, register_browser_home
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -41,6 +42,8 @@ TWILIO_VALIDATE_SIGNATURE = os.getenv("TWILIO_VALIDATE_SIGNATURE", "false").lowe
 MAX_CALL_DURATION_S = max(60, int(os.getenv("MAX_CALL_DURATION_S", "1800")))
 
 app = FastAPI(title="SpeakEasy WIGVO — Soniox Telephony Core", version="0.1.0")
+register_browser_route(app)
+register_browser_home(app)
 
 
 def public_base_url() -> str:
