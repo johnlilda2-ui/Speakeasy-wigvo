@@ -103,6 +103,7 @@ async def browser_translation(ws: WebSocket) -> None:
             "target_language": target_language,
             "voice": voice,
         }
+        translation_seq = 0
         final_original = ""
         non_final_original = ""
         translation_to_speak = ""
@@ -125,7 +126,7 @@ async def browser_translation(ws: WebSocket) -> None:
         })
 
         async def read_stt() -> None:
-            nonlocal final_original, non_final_original, translation_to_speak, speech_started
+            nonlocal final_original, non_final_original, translation_to_speak, speech_started, translation_seq
             try:
                 async for raw in stt_ws:
                     data = json.loads(raw)
@@ -182,10 +183,13 @@ async def browser_translation(ws: WebSocket) -> None:
                                     translation_to_speak = candidate[boundary + 1:]
                                     if chunk:
                                         await _send_tts_chunk(tts_ws, tts_state, chunk)
+                                        translation_seq += 1
+                                        chunk_id = f"tr-{translation_seq}"
                                         await ws.send_json({
                                             "type": "translation_text",
                                             "text": chunk,
                                             "final": True,
+                                            "chunk_id": chunk_id,
                                         })
                             else:
                                 response_non_final_translation.append(text)
@@ -210,10 +214,12 @@ async def browser_translation(ws: WebSocket) -> None:
                             chunk = translation_to_speak.strip()
                             translation_to_speak = ""
                             await _send_tts_chunk(tts_ws, tts_state, chunk)
+                            translation_seq += 1
                             await ws.send_json({
                                 "type": "translation_text",
                                 "text": chunk,
                                 "final": True,
+                                "chunk_id": f"tr-{translation_seq}",
                             })
 
                         non_final_original = ""
@@ -336,7 +342,10 @@ BROWSER_HTML_PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SpeakEasy Browser Translation Test</title>
+<title>SpeakEasy Browser Translation Test v0.4</title>
+<meta http-equiv="Cache-Control" content="no-store">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <style>
 *{box-sizing:border-box}body{margin:0;padding:14px;background:#080d18;color:#eef2ff;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
 main{max-width:720px;margin:auto}.card{background:#151e33;border:1px solid #2d3b5d;border-radius:20px;padding:18px;margin:12px 0}
@@ -351,7 +360,7 @@ button:disabled{opacity:.45}.box{background:#0b1324;border-radius:12px;padding:1
 </head>
 <body>
 <main>
-<div class="card"><h1>SpeakEasy</h1><div class="muted">Real-time speech-to-speech browser test — no Twilio required</div></div>
+<div class="card"><h1>SpeakEasy</h1><div class="muted">Real-time speech-to-speech browser test — no Twilio required · v0.4</div></div>
 
 <div class="card">
 <div class="row">
@@ -379,13 +388,20 @@ function clearAudio(){nodes.forEach(n=>{try{n.stop()}catch(e){}});nodes=[];if(ct
 function play(b64,rate){if(!ctx)return;const raw=Uint8Array.from(atob(b64),c=>c.charCodeAt(0)),p=new Int16Array(raw.buffer),buf=ctx.createBuffer(1,p.length,rate),ch=buf.getChannelData(0);for(let i=0;i<p.length;i++)ch[i]=p[i]/32768;const n=ctx.createBufferSource();n.buffer=buf;n.connect(ctx.destination);playAt=Math.max(playAt,ctx.currentTime+.01);n.start(playAt);playAt+=buf.duration;nodes.push(n);n.onended=()=>nodes=nodes.filter(x=>x!==n)}
 async function microphone(){if(mediaStream)return;mediaStream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true}})}
 function stop(send=true){running=false;if(processor){try{processor.disconnect()}catch(e){}processor=null}if(source){try{source.disconnect()}catch(e){}source=null}clearAudio();if(ws){if(send&&ws.readyState===1)ws.send(JSON.stringify({type:"stop"}));try{ws.close()}catch(e){}ws=null}$("start").disabled=false;$("stop").disabled=true;$("meter").style.width="0";status("Stopped")}
-$("start").onclick=async()=>{try{await microphone();ctx=new(window.AudioContext||window.webkitAudioContext)();await ctx.resume();ws=new WebSocket((location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/api/browser");ws.binaryType="arraybuffer";ws.onopen=()=>{ws.send(JSON.stringify({type:"start",language_a:$("la").value,language_b:$("lb").value,direction:$("dir").value}));source=ctx.createMediaStreamSource(mediaStream);processor=ctx.createScriptProcessor(4096,1,1);processor.onaudioprocess=e=>{if(!running||!ws||ws.readyState!==1)return;const input=e.inputBuffer.getChannelData(0),samples=downsample(input,ctx.sampleRate,16000),p=pcm16(samples);ws.send(p.buffer);let peak=0;for(let i=0;i<input.length;i++)peak=Math.max(peak,Math.abs(input[i]));$("meter").style.width=Math.min(100,peak*170)+"%"};source.connect(processor);const silent=ctx.createGain();silent.gain.value=0;processor.connect(silent);silent.connect(ctx.destination);running=true;$("start").disabled=true;$("stop").disabled=false;status("Connecting…")};let shownFinalOriginal="",shownFinalTranslation="";
+$("start").onclick=async()=>{try{await microphone();ctx=new(window.AudioContext||window.webkitAudioContext)();await ctx.resume();ws=new WebSocket((location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/api/browser");ws.binaryType="arraybuffer";ws.onopen=()=>{ws.send(JSON.stringify({type:"start",language_a:$("la").value,language_b:$("lb").value,direction:$("dir").value}));source=ctx.createMediaStreamSource(mediaStream);processor=ctx.createScriptProcessor(4096,1,1);processor.onaudioprocess=e=>{if(!running||!ws||ws.readyState!==1)return;const input=e.inputBuffer.getChannelData(0),samples=downsample(input,ctx.sampleRate,16000),p=pcm16(samples);ws.send(p.buffer);let peak=0;for(let i=0;i<input.length;i++)peak=Math.max(peak,Math.abs(input[i]));$("meter").style.width=Math.min(100,peak*170)+"%"};source.connect(processor);const silent=ctx.createGain();silent.gain.value=0;processor.connect(silent);silent.connect(ctx.destination);running=true;$("start").disabled=true;$("stop").disabled=false;status("Connecting…")};let lastOriginalSnapshot="", shownTranslationChunks=new Set(), shownTranslationText="";
 ws.onmessage=e=>{const d=JSON.parse(e.data);
-if(d.type==="ready"){shownFinalOriginal="";shownFinalTranslation="";$("original").textContent="—";$("translated").textContent="—";status(d.source_language.toUpperCase()+" → "+d.target_language.toUpperCase()+" — listening")}
+if(d.type==="ready"){lastOriginalSnapshot="";shownTranslationChunks.clear();shownTranslationText="";$("original").textContent="—";$("translated").textContent="—";status(d.source_language.toUpperCase()+" → "+d.target_language.toUpperCase()+" — listening")}
 else if(d.type==="speech_start"){clearAudio();status("Speaking…")}
-else if(d.type==="transcript"){if(d.final){shownFinalOriginal=d.text;$("original").textContent=d.text||"—"}else{$("original").textContent=(shownFinalOriginal+" "+d.text).trim()}}
-else if(d.type==="translation_text"){shownFinalTranslation=(shownFinalTranslation+" "+d.text).trim();$("translated").textContent=shownFinalTranslation}
-else if(d.type==="translation_preview"){/* provisional translation is deliberately display-only; never spoken */}
+else if(d.type==="transcript"){
+  // Soniox non-final results are snapshots, not append-only deltas. Always replace.
+  const incoming=String(d.text||"").trim();
+  if(incoming){lastOriginalSnapshot=incoming;$("original").textContent=incoming}
+}
+else if(d.type==="translation_text"){
+  const id=String(d.chunk_id||d.text||"");
+  if(!shownTranslationChunks.has(id)){shownTranslationChunks.add(id);shownTranslationText=(shownTranslationText+" "+String(d.text||"")).trim();$("translated").textContent=shownTranslationText}
+}
+else if(d.type==="translation_preview"){/* provisional translation is display-only; never spoken */}
 else if(d.type==="audio"){play(d.audio,d.sample_rate||24000);status("Playing translation…")}
 else if(d.type==="utterance_end"){status("Listening…")}
 else if(d.type==="clear_audio"){clearAudio()}
@@ -400,5 +416,12 @@ window.addEventListener("beforeunload",()=>stop(true));
 def register_browser_home(app: Any) -> None:
     from fastapi.responses import HTMLResponse
     @app.get("/browser", response_class=HTMLResponse)
-    async def browser_home() -> str:
-        return BROWSER_HTML_PAGE
+    async def browser_home() -> HTMLResponse:
+        return HTMLResponse(
+            BROWSER_HTML_PAGE,
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
