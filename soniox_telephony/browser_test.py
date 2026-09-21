@@ -89,6 +89,7 @@ async def browser_translation(ws: WebSocket) -> None:
         tts_state = {"stream_id": None, "seq": 0, "target_language": target_language, "voice": voice}
         pending_translation = ""
         transcript_parts = []
+        speech_started = False
 
         await ws.send_json({
             "type": "ready",
@@ -97,7 +98,7 @@ async def browser_translation(ws: WebSocket) -> None:
         })
 
         async def read_stt() -> None:
-            nonlocal pending_translation
+            nonlocal pending_translation, speech_started
             try:
                 async for raw in stt_ws:
                     data = json.loads(raw)
@@ -120,12 +121,16 @@ async def browser_translation(ws: WebSocket) -> None:
                                 pending_translation = ""
                             await ws.send_json({"type": "utterance_end"})
                             transcript_parts.clear()
+                            speech_started = False
                             continue
 
                         if not text:
                             continue
 
                         if status in (None, "none", "original"):
+                            if not speech_started:
+                                speech_started = True
+                                await ws.send_json({"type": "speech_start"})
                             transcript_parts.append(text)
                             await ws.send_json({
                                 "type": "transcript",
@@ -278,7 +283,7 @@ function clearAudio(){nodes.forEach(n=>{try{n.stop()}catch(e){}});nodes=[];if(ct
 function play(b64,rate){if(!ctx)return;const raw=Uint8Array.from(atob(b64),c=>c.charCodeAt(0)),p=new Int16Array(raw.buffer),buf=ctx.createBuffer(1,p.length,rate),ch=buf.getChannelData(0);for(let i=0;i<p.length;i++)ch[i]=p[i]/32768;const n=ctx.createBufferSource();n.buffer=buf;n.connect(ctx.destination);playAt=Math.max(playAt,ctx.currentTime+.01);n.start(playAt);playAt+=buf.duration;nodes.push(n);n.onended=()=>nodes=nodes.filter(x=>x!==n)}
 async function microphone(){if(mediaStream)return;mediaStream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true}})}
 function stop(send=true){running=false;if(processor){try{processor.disconnect()}catch(e){}processor=null}if(source){try{source.disconnect()}catch(e){}source=null}clearAudio();if(ws){if(send&&ws.readyState===1)ws.send(JSON.stringify({type:"stop"}));try{ws.close()}catch(e){}ws=null}$("start").disabled=false;$("stop").disabled=true;$("meter").style.width="0";status("Stopped")}
-$("start").onclick=async()=>{try{await microphone();ctx=new(window.AudioContext||window.webkitAudioContext)();await ctx.resume();ws=new WebSocket((location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/api/browser");ws.binaryType="arraybuffer";ws.onopen=()=>{ws.send(JSON.stringify({type:"start",language_a:$("la").value,language_b:$("lb").value,direction:$("dir").value}));source=ctx.createMediaStreamSource(mediaStream);processor=ctx.createScriptProcessor(4096,1,1);processor.onaudioprocess=e=>{if(!running||!ws||ws.readyState!==1)return;const input=e.inputBuffer.getChannelData(0),samples=downsample(input,ctx.sampleRate,16000),p=pcm16(samples);ws.send(p.buffer);let peak=0;for(let i=0;i<input.length;i++)peak=Math.max(peak,Math.abs(input[i]));$("meter").style.width=Math.min(100,peak*170)+"%"};source.connect(processor);processor.connect(ctx.destination);running=true;$("start").disabled=true;$("stop").disabled=false;status("Connecting…")};ws.onmessage=e=>{const d=JSON.parse(e.data);if(d.type==="ready"){status(d.source_language.toUpperCase()+" → "+d.target_language.toUpperCase()+" — listening")}else if(d.type==="transcript"){if($("original").textContent==="—")$("original").textContent="";$("original").textContent+=d.text}else if(d.type==="translation_text"){if($("translated").textContent==="—")$("translated").textContent="";$("translated").textContent+=d.text}else if(d.type==="audio"){play(d.audio,d.sample_rate||24000);status("Playing translation…")}else if(d.type==="utterance_end"){status("Listening…")}else if(d.type==="clear_audio"){clearAudio()}else if(d.type==="error"){log("ERROR ["+d.stage+"] "+d.message);status("Error — see log")}else if(d.type==="info"){log(d.message)}};ws.onerror=()=>{status("Connection error");log("WebSocket connection error")};ws.onclose=()=>{if(running)stop(false)}}catch(e){status("Microphone error");log(e.message)}}
+$("start").onclick=async()=>{try{await microphone();ctx=new(window.AudioContext||window.webkitAudioContext)();await ctx.resume();ws=new WebSocket((location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/api/browser");ws.binaryType="arraybuffer";ws.onopen=()=>{ws.send(JSON.stringify({type:"start",language_a:$("la").value,language_b:$("lb").value,direction:$("dir").value}));source=ctx.createMediaStreamSource(mediaStream);processor=ctx.createScriptProcessor(4096,1,1);processor.onaudioprocess=e=>{if(!running||!ws||ws.readyState!==1)return;const input=e.inputBuffer.getChannelData(0),samples=downsample(input,ctx.sampleRate,16000),p=pcm16(samples);ws.send(p.buffer);let peak=0;for(let i=0;i<input.length;i++)peak=Math.max(peak,Math.abs(input[i]));$("meter").style.width=Math.min(100,peak*170)+"%"};source.connect(processor);const silent=ctx.createGain();silent.gain.value=0;processor.connect(silent);silent.connect(ctx.destination);running=true;$("start").disabled=true;$("stop").disabled=false;status("Connecting…")};ws.onmessage=e=>{const d=JSON.parse(e.data);if(d.type==="ready"){status(d.source_language.toUpperCase()+" → "+d.target_language.toUpperCase()+" — listening")}else if(d.type==="transcript"){if($("original").textContent==="—")$("original").textContent="";$("original").textContent+=d.text}else if(d.type==="translation_text"){if($("translated").textContent==="—")$("translated").textContent="";$("translated").textContent+=d.text}else if(d.type==="audio"){play(d.audio,d.sample_rate||24000);status("Playing translation…")}else if(d.type==="utterance_end"){status("Listening…")}else if(d.type==="clear_audio"){clearAudio()}else if(d.type==="error"){log("ERROR ["+d.stage+"] "+d.message);status("Error — see log")}else if(d.type==="info"){log(d.message)}};ws.onerror=()=>{status("Connection error");log("WebSocket connection error")};ws.onclose=()=>{if(running)stop(false)}}catch(e){status("Microphone error");log(e.message)}}
 $("stop").onclick=()=>stop(true);
 window.addEventListener("beforeunload",()=>stop(true));
 </script>
