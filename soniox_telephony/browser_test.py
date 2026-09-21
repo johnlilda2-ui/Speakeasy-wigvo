@@ -16,7 +16,7 @@ SONIOX_STT_URL = os.getenv("SONIOX_STT_URL", "wss://stt-rt.soniox.com/transcribe
 SONIOX_TTS_URL = os.getenv("SONIOX_TTS_URL", "wss://tts-rt.soniox.com/tts-websocket")
 SONIOX_STT_MODEL = os.getenv("SONIOX_STT_MODEL", "stt-rt-v5")
 SONIOX_TTS_MODEL = os.getenv("SONIOX_TTS_MODEL", "tts-rt-v2")
-SONIOX_ENDPOINT_DELAY_MS = max(500, min(3000, int(os.getenv("SONIOX_ENDPOINT_DELAY_MS", "500"))))
+SONIOX_ENDPOINT_DELAY_MS = max(500, min(1000, int(os.getenv("SONIOX_ENDPOINT_DELAY_MS", "700"))))
 SONIOX_TTS_VOICE_A = os.getenv("SONIOX_TTS_VOICE_A", "Maya")
 SONIOX_TTS_VOICE_B = os.getenv("SONIOX_TTS_VOICE_B", "Adrian")
 
@@ -91,7 +91,9 @@ async def browser_translation(ws: WebSocket) -> None:
             "language_hints": [source_language],
             "language_hints_strict": True,
             "enable_endpoint_detection": True,
-            "max_endpoint_delay_ms": SONIOX_ENDPOINT_DELAY_MS,
+            "endpoint_latency_adjustment_level": 2,
+            "endpoint_sensitivity": 0.3,
+            "max_endpoint_delay_ms": min(1000, SONIOX_ENDPOINT_DELAY_MS),
             "translation": {"type": "one_way", "target_language": target_language},
         }))
 
@@ -102,8 +104,11 @@ async def browser_translation(ws: WebSocket) -> None:
             "lock": asyncio.Lock(),
             "target_language": target_language,
             "voice": voice,
+            "spoken_chars": 0,
         }
         translation_seq = 0
+        translation_preview = ""
+        translation_last_candidate = ""
         final_original = ""
         non_final_original = ""
         translation_to_speak = ""
@@ -126,7 +131,7 @@ async def browser_translation(ws: WebSocket) -> None:
         })
 
         async def read_stt() -> None:
-            nonlocal final_original, non_final_original, translation_to_speak, speech_started, translation_seq
+            nonlocal final_original, non_final_original, translation_to_speak, speech_started, translation_seq, translation_preview, translation_last_candidate
             try:
                 async for raw in stt_ws:
                     data = json.loads(raw)
@@ -166,33 +171,48 @@ async def browser_translation(ws: WebSocket) -> None:
                                     await ws.send_json({"type": "speech_start"})
                         elif status == "translation":
                             if is_final:
+                                # Confirmed translation is permanently committed.
                                 translation_to_speak += text
-                                newly_confirmed_translation = True
-                                candidate = translation_to_speak
+                                translation_preview = ""
+                            else:
+                                # Soniox may revise non-final translation. Keep it as a
+                                # replaceable snapshot rather than appending it.
+                                translation_preview += text
+
+                            # Translation can arrive mid-sentence. Emit only a
+                            # stable prefix that has survived a subsequent hypothesis update.
+                            candidate = (translation_to_speak + translation_preview).strip()
+                            if candidate:
+                                prev = translation_last_candidate
+                                limit = min(len(prev), len(candidate))
+                                common_len = 0
+                                while common_len < limit and prev[common_len] == candidate[common_len]:
+                                    common_len += 1
+
+                                stable_end = common_len
                                 boundary = max(
-                                    candidate.rfind(" "),
-                                    candidate.rfind(","),
-                                    candidate.rfind("."),
-                                    candidate.rfind("?"),
-                                    candidate.rfind("!"),
-                                    candidate.rfind(":"),
-                                    candidate.rfind(";"),
+                                    candidate[:stable_end].rfind(" "),
+                                    candidate[:stable_end].rfind(","),
+                                    candidate[:stable_end].rfind("."),
+                                    candidate[:stable_end].rfind("?"),
+                                    candidate[:stable_end].rfind("!"),
+                                    candidate[:stable_end].rfind(":"),
+                                    candidate[:stable_end].rfind(";"),
                                 )
-                                if len(candidate) >= 32 and boundary >= 12:
-                                    chunk = candidate[:boundary + 1].strip()
-                                    translation_to_speak = candidate[boundary + 1:]
+                                if boundary >= tts_state["spoken_chars"] + 12:
+                                    chunk = candidate[tts_state["spoken_chars"]:boundary + 1].strip()
                                     if chunk:
-                                        await _send_tts_chunk(tts_ws, tts_state, chunk)
+                                        tts_state["spoken_chars"] = boundary + 1
                                         translation_seq += 1
-                                        chunk_id = f"tr-{translation_seq}"
+                                        await _send_tts_chunk(tts_ws, tts_state, chunk)
                                         await ws.send_json({
                                             "type": "translation_text",
                                             "text": chunk,
                                             "final": True,
-                                            "chunk_id": chunk_id,
+                                            "chunk_id": f"tr-{translation_seq}",
                                         })
-                            else:
-                                response_non_final_translation.append(text)
+
+                            translation_last_candidate = candidate
 
                     non_final_original = "".join(response_non_final_original)
                     current_original = (final_original + non_final_original).strip()
@@ -210,17 +230,23 @@ async def browser_translation(ws: WebSocket) -> None:
                         })
 
                     if saw_endpoint:
-                        if translation_to_speak.strip():
-                            chunk = translation_to_speak.strip()
-                            translation_to_speak = ""
-                            await _send_tts_chunk(tts_ws, tts_state, chunk)
-                            translation_seq += 1
-                            await ws.send_json({
-                                "type": "translation_text",
-                                "text": chunk,
-                                "final": True,
-                                "chunk_id": f"tr-{translation_seq}",
-                            })
+                        final_candidate = (translation_to_speak + translation_preview).strip()
+                        if len(final_candidate) > tts_state["spoken_chars"]:
+                            chunk = final_candidate[tts_state["spoken_chars"]:].strip()
+                            if chunk:
+                                tts_state["spoken_chars"] = len(final_candidate)
+                                translation_seq += 1
+                                await _send_tts_chunk(tts_ws, tts_state, chunk)
+                                await ws.send_json({
+                                    "type": "translation_text",
+                                    "text": chunk,
+                                    "final": True,
+                                    "chunk_id": f"tr-{translation_seq}",
+                                })
+                        translation_to_speak = ""
+                        translation_preview = ""
+                        translation_last_candidate = ""
+                        tts_state["spoken_chars"] = 0
 
                         non_final_original = ""
                         speech_started = False
@@ -391,7 +417,7 @@ function stop(send=true){running=false;if(processor){try{processor.disconnect()}
 $("start").onclick=async()=>{try{await microphone();ctx=new(window.AudioContext||window.webkitAudioContext)();await ctx.resume();ws=new WebSocket((location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/api/browser");ws.binaryType="arraybuffer";ws.onopen=()=>{ws.send(JSON.stringify({type:"start",language_a:$("la").value,language_b:$("lb").value,direction:$("dir").value}));source=ctx.createMediaStreamSource(mediaStream);processor=ctx.createScriptProcessor(4096,1,1);processor.onaudioprocess=e=>{if(!running||!ws||ws.readyState!==1)return;const input=e.inputBuffer.getChannelData(0),samples=downsample(input,ctx.sampleRate,16000),p=pcm16(samples);ws.send(p.buffer);let peak=0;for(let i=0;i<input.length;i++)peak=Math.max(peak,Math.abs(input[i]));$("meter").style.width=Math.min(100,peak*170)+"%"};source.connect(processor);const silent=ctx.createGain();silent.gain.value=0;processor.connect(silent);silent.connect(ctx.destination);running=true;$("start").disabled=true;$("stop").disabled=false;status("Connecting…")};let lastOriginalSnapshot="", shownTranslationChunks=new Set(), shownTranslationText="";
 ws.onmessage=e=>{const d=JSON.parse(e.data);
 if(d.type==="ready"){lastOriginalSnapshot="";shownTranslationChunks.clear();shownTranslationText="";$("original").textContent="—";$("translated").textContent="—";status(d.source_language.toUpperCase()+" → "+d.target_language.toUpperCase()+" — listening")}
-else if(d.type==="speech_start"){clearAudio();status("Speaking…")}
+else if(d.type==="speech_start"){status("Speaking…")}
 else if(d.type==="transcript"){
   // Soniox non-final results are snapshots, not append-only deltas. Always replace.
   const incoming=String(d.text||"").trim();
