@@ -20,31 +20,40 @@ SONIOX_ENDPOINT_DELAY_MS = max(500, min(3000, int(os.getenv("SONIOX_ENDPOINT_DEL
 SONIOX_TTS_VOICE_A = os.getenv("SONIOX_TTS_VOICE_A", "Maya")
 SONIOX_TTS_VOICE_B = os.getenv("SONIOX_TTS_VOICE_B", "Adrian")
 
-async def _send_tts_chunk(tts_ws: Any, state: dict[str, Any], text: str, final: bool = False) -> None:
-    if not text and not final:
+async def _send_tts_chunk(tts_ws: Any, state: dict[str, Any], text: str) -> None:
+    """Speak one confirmed translation chunk on a short-lived TTS stream.
+
+    Soniox closes a stream that waits a few seconds for more text. Therefore
+    every browser chunk is sent as a complete TTS stream with text_end=true.
+    The WebSocket connection itself stays open for the next chunk.
+    """
+    text = text.strip()
+    if not text:
         return
-    stream_id = state.get("stream_id")
-    if not stream_id:
-        state["seq"] = int(state.get("seq", 0)) + 1
+    async with state["lock"]:
+        state["seq"] += 1
         stream_id = f"browser-{state['seq']}-{uuid4().hex[:8]}"
-        state["stream_id"] = stream_id
-        await tts_ws.send(json.dumps({
-            "api_key": SONIOX_API_KEY,
-            "model": SONIOX_TTS_MODEL,
-            "language": state["target_language"],
-            "voice": state["voice"],
-            "audio_format": "pcm_s16le",
-            "sample_rate": 24000,
-            "stream_id": stream_id,
-            "speed": 1.0,
-        }))
-    await tts_ws.send(json.dumps({
-        "stream_id": stream_id,
-        "text": text,
-        "text_end": final,
-    }))
-    if final:
-        state["stream_id"] = None
+        state["active"].add(stream_id)
+        try:
+            await tts_ws.send(json.dumps({
+                "api_key": SONIOX_API_KEY,
+                "model": SONIOX_TTS_MODEL,
+                "language": state["target_language"],
+                "voice": state["voice"],
+                "audio_format": "pcm_s16le",
+                "sample_rate": 24000,
+                "stream_id": stream_id,
+            }))
+            await tts_ws.send(json.dumps({
+                "stream_id": stream_id,
+                "text": text,
+                "text_end": True,
+            }))
+            await asyncio.sleep(0)
+        finally:
+            # Keep the id marked active until the reader sees terminated.
+            # This prevents accidental reuse/cancellation races.
+            pass
 
 async def browser_translation(ws: WebSocket) -> None:
     await ws.accept()
@@ -86,9 +95,17 @@ async def browser_translation(ws: WebSocket) -> None:
         }))
 
         tts_ws = await websockets.connect(SONIOX_TTS_URL, ping_interval=20, ping_timeout=20, close_timeout=5)
-        tts_state = {"stream_id": None, "seq": 0, "target_language": target_language, "voice": voice}
-        pending_translation = ""
-        transcript_parts = []
+        tts_state = {
+            "seq": 0,
+            "active": set(),
+            "lock": asyncio.Lock(),
+            "target_language": target_language,
+            "voice": voice,
+        }
+        final_original = ""
+        non_final_original = ""
+        final_translation = ""
+        translation_to_speak = ""
         speech_started = False
 
         await ws.send_json({
@@ -98,7 +115,7 @@ async def browser_translation(ws: WebSocket) -> None:
         })
 
         async def read_stt() -> None:
-            nonlocal pending_translation, speech_started
+            nonlocal final_original, non_final_original, final_translation, translation_to_speak, speech_started
             try:
                 async for raw in stt_ws:
                     data = json.loads(raw)
@@ -110,46 +127,84 @@ async def browser_translation(ws: WebSocket) -> None:
                         })
                         continue
 
+                    response_non_final_original = []
+                    response_non_final_translation = []
+
                     for token in data.get("tokens") or []:
                         text = str(token.get("text") or "")
                         status = token.get("translation_status")
-                        final = bool(token.get("is_final"))
+                        is_final = bool(token.get("is_final"))
 
                         if text == "<end>":
-                            if pending_translation.strip():
-                                await _send_tts_chunk(tts_ws, tts_state, pending_translation, True)
-                                pending_translation = ""
-                            await ws.send_json({"type": "utterance_end"})
-                            transcript_parts.clear()
+                            # Any confirmed translated text not already spoken is flushed
+                            # as one final TTS stream.
+                            if translation_to_speak.strip():
+                                chunk = translation_to_speak.strip()
+                                translation_to_speak = ""
+                                await _send_tts_chunk(tts_ws, tts_state, chunk)
+                                await ws.send_json({"type": "translation_text", "text": chunk, "final": True})
+                            non_final_original = ""
                             speech_started = False
+                            await ws.send_json({
+                                "type": "transcript",
+                                "text": final_original,
+                                "final": True,
+                            })
+                            await ws.send_json({"type": "utterance_end"})
                             continue
 
                         if not text:
                             continue
 
                         if status in (None, "none", "original"):
-                            if not speech_started:
-                                speech_started = True
-                                await ws.send_json({"type": "speech_start"})
-                            transcript_parts.append(text)
+                            if is_final:
+                                final_original += text
+                            else:
+                                response_non_final_original.append(text)
+                                if not speech_started:
+                                    speech_started = True
+                                    await ws.send_json({"type": "speech_start"})
                             await ws.send_json({
                                 "type": "transcript",
-                                "text": text,
-                                "final": final,
+                                "text": final_original + "".join(response_non_final_original),
+                                "final": is_final,
                             })
-                            if final:
-                                await ws.send_json({"type": "speech_activity"})
 
                         elif status == "translation":
-                            pending_translation += text
-                            # Send complete-ish translated chunks while the speaker is still talking.
-                            candidate = pending_translation
-                            boundary = max(candidate.rfind(" "), candidate.rfind(","), candidate.rfind("."), candidate.rfind("?"), candidate.rfind("!"))
-                            if len(candidate) >= 18 and boundary >= 8:
-                                chunk = candidate[:boundary + 1]
-                                pending_translation = candidate[boundary + 1:]
-                                await _send_tts_chunk(tts_ws, tts_state, chunk, False)
-                                await ws.send_json({"type": "translation_text", "text": chunk})
+                            if is_final:
+                                final_translation += text
+                                translation_to_speak += text
+                                # Speak only confirmed translation text. This is the
+                                # important deduplication rule: non-final translation
+                                # hypotheses are never sent to TTS.
+                                candidate = translation_to_speak
+                                boundary = max(
+                                    candidate.rfind(" "),
+                                    candidate.rfind(","),
+                                    candidate.rfind("."),
+                                    candidate.rfind("?"),
+                                    candidate.rfind("!"),
+                                    candidate.rfind(":"),
+                                    candidate.rfind(";"),
+                                )
+                                if len(candidate) >= 24 and boundary >= 10:
+                                    chunk = candidate[:boundary + 1].strip()
+                                    translation_to_speak = candidate[boundary + 1:]
+                                    if chunk:
+                                        await _send_tts_chunk(tts_ws, tts_state, chunk)
+                                        await ws.send_json({
+                                            "type": "translation_text",
+                                            "text": chunk,
+                                            "final": True,
+                                        })
+                            else:
+                                response_non_final_translation.append(text)
+
+                    if response_non_final_translation:
+                        await ws.send_json({
+                            "type": "translation_preview",
+                            "text": "".join(response_non_final_translation),
+                        })
 
                     if data.get("finished"):
                         break
@@ -160,27 +215,49 @@ async def browser_translation(ws: WebSocket) -> None:
             try:
                 async for raw in tts_ws:
                     data = json.loads(raw)
+                    sid = data.get("stream_id")
                     if data.get("error_code") is not None:
                         await ws.send_json({
                             "type": "error",
                             "stage": "tts",
                             "message": data.get("error_message", "Soniox TTS error"),
+                            "stream_id": sid,
                         })
+                        if sid:
+                            tts_state["active"].discard(sid)
                         continue
+
                     audio = data.get("audio")
                     if audio:
                         await ws.send_json({
                             "type": "audio",
                             "audio": audio,
                             "sample_rate": 24000,
+                            "stream_id": sid,
                         })
-                    if data.get("terminated"):
-                        continue
+
+                    if data.get("terminated") and sid:
+                        tts_state["active"].discard(sid)
             except asyncio.CancelledError:
                 pass
 
         stt_task = asyncio.create_task(read_stt())
         tts_task = asyncio.create_task(read_tts())
+
+        async def keepalive() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(15)
+                    if stt_ws:
+                        await stt_ws.send(json.dumps({"type": "keepalive"}))
+                    if tts_ws:
+                        await tts_ws.send(json.dumps({"keep_alive": True}))
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+        keepalive_task = asyncio.create_task(keepalive())
 
         while True:
             if time.monotonic() - started > 600:
@@ -218,7 +295,7 @@ async def browser_translation(ws: WebSocket) -> None:
         except Exception:
             pass
     finally:
-        for task in (stt_task, tts_task):
+        for task in (stt_task, tts_task, keepalive_task):
             if task:
                 task.cancel()
         for soniox_ws in (stt_ws, tts_ws):
@@ -268,7 +345,7 @@ button:disabled{opacity:.45}.box{background:#0b1324;border-radius:12px;padding:1
 <div id="status" style="font-weight:700">Ready</div>
 </div>
 
-<div class="card"><div class="muted">Original speech</div><div id="original" class="box">—</div><div class="muted" style="margin-top:13px">Translated speech</div><div id="translated" class="box">—</div></div>
+<div class="card"><div class="muted">Original speech</div><div id="original" class="box">—</div><div class="muted" style="margin-top:13px">Translated speech (confirmed)</div><div id="translated" class="box">—</div></div>
 <div class="card"><div class="muted">Session log</div><div id="log"></div></div>
 </main>
 
@@ -283,7 +360,18 @@ function clearAudio(){nodes.forEach(n=>{try{n.stop()}catch(e){}});nodes=[];if(ct
 function play(b64,rate){if(!ctx)return;const raw=Uint8Array.from(atob(b64),c=>c.charCodeAt(0)),p=new Int16Array(raw.buffer),buf=ctx.createBuffer(1,p.length,rate),ch=buf.getChannelData(0);for(let i=0;i<p.length;i++)ch[i]=p[i]/32768;const n=ctx.createBufferSource();n.buffer=buf;n.connect(ctx.destination);playAt=Math.max(playAt,ctx.currentTime+.01);n.start(playAt);playAt+=buf.duration;nodes.push(n);n.onended=()=>nodes=nodes.filter(x=>x!==n)}
 async function microphone(){if(mediaStream)return;mediaStream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true}})}
 function stop(send=true){running=false;if(processor){try{processor.disconnect()}catch(e){}processor=null}if(source){try{source.disconnect()}catch(e){}source=null}clearAudio();if(ws){if(send&&ws.readyState===1)ws.send(JSON.stringify({type:"stop"}));try{ws.close()}catch(e){}ws=null}$("start").disabled=false;$("stop").disabled=true;$("meter").style.width="0";status("Stopped")}
-$("start").onclick=async()=>{try{await microphone();ctx=new(window.AudioContext||window.webkitAudioContext)();await ctx.resume();ws=new WebSocket((location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/api/browser");ws.binaryType="arraybuffer";ws.onopen=()=>{ws.send(JSON.stringify({type:"start",language_a:$("la").value,language_b:$("lb").value,direction:$("dir").value}));source=ctx.createMediaStreamSource(mediaStream);processor=ctx.createScriptProcessor(4096,1,1);processor.onaudioprocess=e=>{if(!running||!ws||ws.readyState!==1)return;const input=e.inputBuffer.getChannelData(0),samples=downsample(input,ctx.sampleRate,16000),p=pcm16(samples);ws.send(p.buffer);let peak=0;for(let i=0;i<input.length;i++)peak=Math.max(peak,Math.abs(input[i]));$("meter").style.width=Math.min(100,peak*170)+"%"};source.connect(processor);const silent=ctx.createGain();silent.gain.value=0;processor.connect(silent);silent.connect(ctx.destination);running=true;$("start").disabled=true;$("stop").disabled=false;status("Connecting…")};ws.onmessage=e=>{const d=JSON.parse(e.data);if(d.type==="ready"){status(d.source_language.toUpperCase()+" → "+d.target_language.toUpperCase()+" — listening")}else if(d.type==="transcript"){if($("original").textContent==="—")$("original").textContent="";$("original").textContent+=d.text}else if(d.type==="translation_text"){if($("translated").textContent==="—")$("translated").textContent="";$("translated").textContent+=d.text}else if(d.type==="audio"){play(d.audio,d.sample_rate||24000);status("Playing translation…")}else if(d.type==="utterance_end"){status("Listening…")}else if(d.type==="clear_audio"){clearAudio()}else if(d.type==="error"){log("ERROR ["+d.stage+"] "+d.message);status("Error — see log")}else if(d.type==="info"){log(d.message)}};ws.onerror=()=>{status("Connection error");log("WebSocket connection error")};ws.onclose=()=>{if(running)stop(false)}}catch(e){status("Microphone error");log(e.message)}}
+$("start").onclick=async()=>{try{await microphone();ctx=new(window.AudioContext||window.webkitAudioContext)();await ctx.resume();ws=new WebSocket((location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/api/browser");ws.binaryType="arraybuffer";ws.onopen=()=>{ws.send(JSON.stringify({type:"start",language_a:$("la").value,language_b:$("lb").value,direction:$("dir").value}));source=ctx.createMediaStreamSource(mediaStream);processor=ctx.createScriptProcessor(4096,1,1);processor.onaudioprocess=e=>{if(!running||!ws||ws.readyState!==1)return;const input=e.inputBuffer.getChannelData(0),samples=downsample(input,ctx.sampleRate,16000),p=pcm16(samples);ws.send(p.buffer);let peak=0;for(let i=0;i<input.length;i++)peak=Math.max(peak,Math.abs(input[i]));$("meter").style.width=Math.min(100,peak*170)+"%"};source.connect(processor);const silent=ctx.createGain();silent.gain.value=0;processor.connect(silent);silent.connect(ctx.destination);running=true;$("start").disabled=true;$("stop").disabled=false;status("Connecting…")};let shownFinalOriginal="",shownFinalTranslation="";
+ws.onmessage=e=>{const d=JSON.parse(e.data);
+if(d.type==="ready"){shownFinalOriginal="";shownFinalTranslation="";$("original").textContent="—";$("translated").textContent="—";status(d.source_language.toUpperCase()+" → "+d.target_language.toUpperCase()+" — listening")}
+else if(d.type==="speech_start"){clearAudio();status("Speaking…")}
+else if(d.type==="transcript"){if(d.final){shownFinalOriginal=d.text;$("original").textContent=d.text||"—"}else{$("original").textContent=(shownFinalOriginal+" "+d.text).trim()}}
+else if(d.type==="translation_text"){shownFinalTranslation=(shownFinalTranslation+" "+d.text).trim();$("translated").textContent=shownFinalTranslation}
+else if(d.type==="translation_preview"){/* provisional translation is deliberately display-only; never spoken */}
+else if(d.type==="audio"){play(d.audio,d.sample_rate||24000);status("Playing translation…")}
+else if(d.type==="utterance_end"){status("Listening…")}
+else if(d.type==="clear_audio"){clearAudio()}
+else if(d.type==="error"){log("ERROR ["+d.stage+"] "+d.message);status("Error — see log")}
+else if(d.type==="info"){log(d.message)}};ws.onerror=()=>{status("Connection error");log("WebSocket connection error")};ws.onclose=()=>{if(running)stop(false)}}catch(e){status("Microphone error");log(e.message)}}
 $("stop").onclick=()=>stop(true);
 window.addEventListener("beforeunload",()=>stop(true));
 </script>
