@@ -67,6 +67,7 @@ async def browser_translation(ws: WebSocket) -> None:
     tts_ws = None
     stt_task = None
     tts_task = None
+    keepalive_task = None
     started = time.monotonic()
 
     try:
@@ -104,9 +105,18 @@ async def browser_translation(ws: WebSocket) -> None:
         }
         final_original = ""
         non_final_original = ""
-        final_translation = ""
         translation_to_speak = ""
         speech_started = False
+
+        async def cancel_active_tts() -> None:
+            async with tts_state["lock"]:
+                active = list(tts_state["active"])
+                for sid in active:
+                    try:
+                        await tts_ws.send(json.dumps({"stream_id": sid, "cancel": True}))
+                    except Exception:
+                        pass
+                tts_state["active"].clear()
 
         await ws.send_json({
             "type": "ready",
@@ -115,7 +125,7 @@ async def browser_translation(ws: WebSocket) -> None:
         })
 
         async def read_stt() -> None:
-            nonlocal final_original, non_final_original, final_translation, translation_to_speak, speech_started
+            nonlocal final_original, non_final_original, translation_to_speak, speech_started
             try:
                 async for raw in stt_ws:
                     data = json.loads(raw)
@@ -129,6 +139,8 @@ async def browser_translation(ws: WebSocket) -> None:
 
                     response_non_final_original = []
                     response_non_final_translation = []
+                    saw_endpoint = False
+                    newly_confirmed_translation = False
 
                     for token in data.get("tokens") or []:
                         text = str(token.get("text") or "")
@@ -136,21 +148,7 @@ async def browser_translation(ws: WebSocket) -> None:
                         is_final = bool(token.get("is_final"))
 
                         if text == "<end>":
-                            # Any confirmed translated text not already spoken is flushed
-                            # as one final TTS stream.
-                            if translation_to_speak.strip():
-                                chunk = translation_to_speak.strip()
-                                translation_to_speak = ""
-                                await _send_tts_chunk(tts_ws, tts_state, chunk)
-                                await ws.send_json({"type": "translation_text", "text": chunk, "final": True})
-                            non_final_original = ""
-                            speech_started = False
-                            await ws.send_json({
-                                "type": "transcript",
-                                "text": final_original,
-                                "final": True,
-                            })
-                            await ws.send_json({"type": "utterance_end"})
+                            saw_endpoint = True
                             continue
 
                         if not text:
@@ -163,20 +161,12 @@ async def browser_translation(ws: WebSocket) -> None:
                                 response_non_final_original.append(text)
                                 if not speech_started:
                                     speech_started = True
+                                    await cancel_active_tts()
                                     await ws.send_json({"type": "speech_start"})
-                            await ws.send_json({
-                                "type": "transcript",
-                                "text": final_original + "".join(response_non_final_original),
-                                "final": is_final,
-                            })
-
                         elif status == "translation":
                             if is_final:
-                                final_translation += text
                                 translation_to_speak += text
-                                # Speak only confirmed translation text. This is the
-                                # important deduplication rule: non-final translation
-                                # hypotheses are never sent to TTS.
+                                newly_confirmed_translation = True
                                 candidate = translation_to_speak
                                 boundary = max(
                                     candidate.rfind(" "),
@@ -187,7 +177,7 @@ async def browser_translation(ws: WebSocket) -> None:
                                     candidate.rfind(":"),
                                     candidate.rfind(";"),
                                 )
-                                if len(candidate) >= 24 and boundary >= 10:
+                                if len(candidate) >= 32 and boundary >= 12:
                                     chunk = candidate[:boundary + 1].strip()
                                     translation_to_speak = candidate[boundary + 1:]
                                     if chunk:
@@ -200,11 +190,40 @@ async def browser_translation(ws: WebSocket) -> None:
                             else:
                                 response_non_final_translation.append(text)
 
+                    non_final_original = "".join(response_non_final_original)
+                    current_original = (final_original + non_final_original).strip()
+                    if current_original:
+                        await ws.send_json({
+                            "type": "transcript",
+                            "text": current_original,
+                            "final": False,
+                        })
+
                     if response_non_final_translation:
                         await ws.send_json({
                             "type": "translation_preview",
                             "text": "".join(response_non_final_translation),
                         })
+
+                    if saw_endpoint:
+                        if translation_to_speak.strip():
+                            chunk = translation_to_speak.strip()
+                            translation_to_speak = ""
+                            await _send_tts_chunk(tts_ws, tts_state, chunk)
+                            await ws.send_json({
+                                "type": "translation_text",
+                                "text": chunk,
+                                "final": True,
+                            })
+
+                        non_final_original = ""
+                        speech_started = False
+                        await ws.send_json({
+                            "type": "transcript",
+                            "text": final_original.strip(),
+                            "final": True,
+                        })
+                        await ws.send_json({"type": "utterance_end"})
 
                     if data.get("finished"):
                         break
