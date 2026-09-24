@@ -20,21 +20,25 @@ SONIOX_ENDPOINT_DELAY_MS = max(500, min(1000, int(os.getenv("SONIOX_ENDPOINT_DEL
 SONIOX_TTS_VOICE_A = os.getenv("SONIOX_TTS_VOICE_A", "Maya")
 SONIOX_TTS_VOICE_B = os.getenv("SONIOX_TTS_VOICE_B", "Adrian")
 
-async def _send_tts_chunk(tts_ws: Any, state: dict[str, Any], text: str) -> None:
-    """Speak one confirmed translation chunk on a short-lived TTS stream.
+async def _send_tts_text(tts_ws: Any, state: dict[str, Any], text: str = "", text_end: bool = False) -> str:
+    """Send incremental translated text to a persistent per-utterance Soniox TTS stream.
 
-    Soniox closes a stream that waits a few seconds for more text. Therefore
-    every browser chunk is sent as a complete TTS stream with text_end=true.
-    The WebSocket connection itself stays open for the next chunk.
+    A stream stays open while translated chunks arrive, then receives text_end at
+    the utterance boundary. The next utterance gets a new stream, but existing
+    streams are never cancelled just because new source speech begins.
     """
     text = text.strip()
-    if not text:
-        return
+    if not text and not text_end:
+        return ""
+
     async with state["lock"]:
-        state["seq"] += 1
-        stream_id = f"browser-{state['seq']}-{uuid4().hex[:8]}"
-        state["active"].add(stream_id)
-        try:
+        stream_id = state["current_stream_id"]
+        if not stream_id:
+            state["seq"] += 1
+            stream_id = f"browser-{state['seq']}-{uuid4().hex[:8]}"
+            state["active"].add(stream_id)
+            state["stream_started_at"][stream_id] = time.monotonic()
+            state["first_audio_logged"].discard(stream_id)
             await tts_ws.send(json.dumps({
                 "api_key": SONIOX_API_KEY,
                 "model": SONIOX_TTS_MODEL,
@@ -44,16 +48,24 @@ async def _send_tts_chunk(tts_ws: Any, state: dict[str, Any], text: str) -> None
                 "sample_rate": 24000,
                 "stream_id": stream_id,
             }))
-            await tts_ws.send(json.dumps({
-                "stream_id": stream_id,
-                "text": text,
-                "text_end": True,
-            }))
-            await asyncio.sleep(0)
-        finally:
-            # Keep the id marked active until the reader sees terminated.
-            # This prevents accidental reuse/cancellation races.
-            pass
+            state["current_stream_id"] = stream_id
+            state["utterance_streams"] += 1
+            print(f"[tts] open {stream_id}", flush=True)
+
+        await tts_ws.send(json.dumps({
+            "stream_id": stream_id,
+            "text": text,
+            "text_end": text_end,
+        }))
+        print(f"[tts] text stream={stream_id} end={text_end} chars={len(text)}", flush=True)
+
+        # text_end closes this logical utterance, but the underlying WebSocket
+        # remains open and the currently generated audio is allowed to finish.
+        if text_end and state["current_stream_id"] == stream_id:
+            state["current_stream_id"] = None
+
+        return stream_id
+
 
 async def browser_translation(ws: WebSocket) -> None:
     await ws.accept()
@@ -108,22 +120,16 @@ async def browser_translation(ws: WebSocket) -> None:
             "final_translation": "",
             "last_translation_candidate": "",
             "translation_seq": 0,
+            "current_stream_id": None,
+            "stream_started_at": {},
+            "first_audio_logged": set(),
+            "utterance_streams": 0,
         }
         translation_seq = 0
         final_original = ""
         non_final_original = ""
         translation_to_speak = ""
         speech_started = False
-
-        async def cancel_active_tts() -> None:
-            async with tts_state["lock"]:
-                active = list(tts_state["active"])
-                for sid in active:
-                    try:
-                        await tts_ws.send(json.dumps({"stream_id": sid, "cancel": True}))
-                    except Exception:
-                        pass
-                tts_state["active"].clear()
 
         await ws.send_json({
             "type": "ready",
@@ -212,13 +218,13 @@ async def browser_translation(ws: WebSocket) -> None:
                             candidate[:stable_end].rfind(";"),
                         )
 
-                        if boundary >= tts_state["spoken_chars"] + 12:
+                        if boundary >= tts_state["spoken_chars"] + 8:
                             chunk = candidate[tts_state["spoken_chars"]:boundary + 1].strip()
                             if chunk:
                                 tts_state["spoken_chars"] = boundary + 1
                                 translation_seq = tts_state["translation_seq"] + 1
                                 tts_state["translation_seq"] = translation_seq
-                                await _send_tts_chunk(tts_ws, tts_state, chunk)
+                                await _send_tts_text(tts_ws, tts_state, chunk, text_end=False)
                                 await ws.send_json({
                                     "type": "translation_text",
                                     "text": chunk,
@@ -242,7 +248,7 @@ async def browser_translation(ws: WebSocket) -> None:
                                 tts_state["spoken_chars"] = len(final_candidate)
                                 translation_seq = tts_state["translation_seq"] + 1
                                 tts_state["translation_seq"] = translation_seq
-                                await _send_tts_chunk(tts_ws, tts_state, chunk)
+                                await _send_tts_text(tts_ws, tts_state, chunk, text_end=True)
                                 await ws.send_json({
                                     "type": "translation_text",
                                     "text": chunk,
@@ -374,7 +380,7 @@ BROWSER_HTML_PAGE = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SpeakEasy Browser Translation Test v0.5</title>
+<title>SpeakEasy Browser Translation Test v0.6</title>
 <meta http-equiv="Cache-Control" content="no-store">
 <meta http-equiv="Pragma" content="no-cache">
 <meta http-equiv="Expires" content="0">
@@ -392,7 +398,7 @@ button:disabled{opacity:.45}.box{background:#0b1324;border-radius:12px;padding:1
 </head>
 <body>
 <main>
-<div class="card"><h1>SpeakEasy</h1><div class="muted">Real-time speech-to-speech browser test — no Twilio required · v0.4</div></div>
+<div class="card"><h1>SpeakEasy</h1><div class="muted">Real-time speech-to-speech browser test — no Twilio required · v0.6</div></div>
 
 <div class="card">
 <div class="row">
@@ -436,7 +442,7 @@ else if(d.type==="translation_text"){
 else if(d.type==="translation_preview"){/* provisional translation is display-only; never spoken */}
 else if(d.type==="audio"){play(d.audio,d.sample_rate||24000);status("Playing translation…")}
 else if(d.type==="utterance_end"){status("Listening…")}
-else if(d.type==="clear_audio"){clearAudio()}
+else if(d.type==="clear_audio"){log("Ignoring live clear_audio request so queued translated speech can finish.")}
 else if(d.type==="error"){log("ERROR ["+d.stage+"] "+d.message);status("Error — see log")}
 else if(d.type==="info"){log(d.message)}};ws.onerror=()=>{status("Connection error");log("WebSocket connection error")};ws.onclose=()=>{if(running)stop(false)}}catch(e){status("Microphone error");log(e.message)}}
 $("stop").onclick=()=>stop(true);
