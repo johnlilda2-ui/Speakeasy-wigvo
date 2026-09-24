@@ -786,7 +786,22 @@ const channel=v=>(config.agora_channel_prefix||"speakeasy-")+roomName(v);
 function down(a,from,to){if(from===to)return a;const r=from/to,n=Math.max(1,Math.round(a.length/r)),o=new Float32Array(n);let p=0;for(let i=0;i<n;i++){const q=Math.min(a.length,Math.round((i+1)*r));let s=0,c=0;for(let j=p;j<q;j++){s+=a[j];c++}o[i]=c?s/c:0;p=q}return o}
 function pcm(a){const o=new Int16Array(a.length);for(let i=0;i<a.length;i++){const s=Math.max(-1,Math.min(1,a[i]));o[i]=s<0?s*32768:s*32767}return o}
 function clearQueue(){staged.forEach(n=>{try{n.stop()}catch(e){}});staged=[];if(playCtx)playAt=playCtx.currentTime+.02}
-function playTranslated(b64,rate){if(!playCtx||!outDestination)return;const bytes=Uint8Array.from(atob(b64),c=>c.charCodeAt(0));const s=new Int16Array(bytes.buffer,bytes.byteOffset,Math.floor(bytes.byteLength/2));const b=playCtx.createBuffer(1,s.length,rate);const ch=b.getChannelData(0);for(let i=0;i<s.length;i++)ch[i]=s[i]/32768;const n=playCtx.createBufferSource();n.buffer=b;n.connect(outDestination);playAt=Math.max(playAt,playCtx.currentTime+.01);n.start(playAt);playAt+=b.duration;staged.push(n);n.onended=()=>staged=staged.filter(x=>x!==n);$("orb").classList.add("speaking")}
+function playTranslated(b64,rate){
+  if(!playCtx||!outDestination){write("PLAY  [error] audio context unavailable");return}
+  const bytes=Uint8Array.from(atob(b64),c=>c.charCodeAt(0));
+  const s=new Int16Array(bytes.buffer,bytes.byteOffset,Math.floor(bytes.byteLength/2));
+  const b=playCtx.createBuffer(1,s.length,rate);
+  const ch=b.getChannelData(0);
+  for(let i=0;i<s.length;i++)ch[i]=s[i]/32768;
+  const n=playCtx.createBufferSource();
+  n.buffer=b;n.connect(outDestination);
+  playAt=Math.max(playAt,playCtx.currentTime+.01);
+  n.start(playAt);playAt+=b.duration;
+  staged.push(n);
+  write("PLAY  [local] queued "+Math.round(b.duration*1000)+" ms TTS audio");
+  n.onended=()=>staged=staged.filter(x=>x!==n);
+  $("orb").classList.add("speaking")
+}
 async function loadAgora(){if(AgoraRTC)return;await new Promise((ok,bad)=>{const s=document.createElement("script");s.src="https://download.agora.io/sdk/release/AgoraRTC_N-"+encodeURIComponent(config.agora_sdk_version)+".js";s.onload=ok;s.onerror=()=>bad(new Error("Could not load Agora Web SDK"));document.head.appendChild(s)});AgoraRTC=window.AgoraRTC}
 async function stopCall(){
   running=false;
@@ -835,7 +850,7 @@ async function startCall(){
         await c.subscribe(user,"audio");
         if(user.audioTrack){
           user.audioTrack.play();
-          write("Remote live voice connected (UID "+user.uid+")");
+          write("REMOTE [B] audio subscribed (UID "+user.uid+")");
         }
       }catch(e){
         if(c===client)write("Remote audio error: "+(e?.message||e));
@@ -846,7 +861,7 @@ async function startCall(){
       await subscribeRemoteAudio(user);
     });
     c.on("user-unpublished",(u,type)=>{
-      if(type==="audio"&&c===client)write("Remote live voice stopped (UID "+u.uid+")");
+      if(type==="audio"&&c===client)write("REMOTE [B] audio stopped (UID "+u.uid+")");
     });
 
     const uid=Math.floor(100000+Math.random()*900000);
@@ -872,11 +887,32 @@ async function startCall(){
         const data=JSON.parse(ev.data);
         if(data.type==="ready"){write("Soniox TTS-only pipeline ready");return}
         if(data.type==="error"){write("["+data.stage+"] "+data.message);return}
-        if(data.type==="tts_text"){write("TTS: "+data.text);return}
+        if(data.type==="raw_stt"){
+          const label=data.final_text||data.partial_text||data.text||"";
+          if(label)write("STT  ["+(data.final?"final":"live")+"] "+label);
+          return;
+        }
+        if(data.type==="transcript"){
+          if(data.final)write("STT  [FINAL] "+(data.text||""));
+          return;
+        }
+        if(data.type==="tts_text"){
+          write("TTS  ["+(data.final?"FINAL":"live")+"] "+(data.text||""));
+          return;
+        }
         if(data.type==="audio"){
+          write("AUDIO [server] Soniox TTS audio received ("+(data.sample_rate||24000)+" Hz)");
           playTranslated(data.audio,data.sample_rate||24000);
           audioAt=performance.now();
           if(!timingAudioShown){timingAudioShown=true;renderTiming()}
+          return;
+        }
+        if(data.type==="pipeline_timing"){
+          pipelineTiming[data.stage]=data.elapsed_ms;
+          if(data.stage==="tts_text_sent") write("TTS  [sent] "+(data.elapsed_ms||0)+" ms after speech start");
+          if(data.stage==="audio_server") write("AUDIO [server] first audio "+(data.elapsed_ms||0)+" ms after speech start");
+          renderTiming();
+          return;
         }
       }catch(e){write("Pipeline message error: "+(e?.message||e))}
     };
@@ -910,6 +946,7 @@ async function startCall(){
     localTrack=AgoraRTC.createCustomAudioTrack({mediaStreamTrack:outTrack,encoderConfig:"speech_low_quality"});
     if(!starting)throw new Error("Call was stopped while preparing TTS audio");
     await c.publish([localTrack]);
+    write("AGORA [A] Soniox TTS audio track published to room");
 
     for(const user of (c.remoteUsers||[])){
       await subscribeRemoteAudio(user);
