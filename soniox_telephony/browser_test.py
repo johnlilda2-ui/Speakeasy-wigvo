@@ -548,14 +548,49 @@ async def browser_translation(ws: WebSocket) -> None:
                         completed_original = (
                             final_original + "".join(preview_original)
                         ).strip()
-                        try:
-                            state["tts_queue"].put_nowait({
-                                "text": "",
-                                "end": True,
-                                "utterance_id": ending_utterance_id,
-                            })
-                        except asyncio.QueueFull:
-                            pass
+                        if state.get("tts_only"):
+                            # Flush any final characters that did not contain a
+                            # word boundary while the speaker was talking.
+                            # Short utterances such as "Hello" must still reach
+                            # TTS before the stream is ended.
+                            tts_candidate = completed_original
+                            sent = int(state.get("tts_only_sent", 0))
+                            remaining = tts_candidate[sent:].strip()
+                            if remaining:
+                                try:
+                                    state["tts_queue"].put_nowait({
+                                        "text": remaining,
+                                        "end": True,
+                                        "utterance_id": ending_utterance_id,
+                                    })
+                                    state["tts_only_sent"] = len(tts_candidate)
+                                    state["translation_seq"] += 1
+                                    await ws.send_json({
+                                        "type": "tts_text",
+                                        "text": remaining,
+                                        "final": True,
+                                        "chunk_id": f"tts-{state['translation_seq']}",
+                                    })
+                                except asyncio.QueueFull:
+                                    pass
+                            else:
+                                try:
+                                    state["tts_queue"].put_nowait({
+                                        "text": "",
+                                        "end": True,
+                                        "utterance_id": ending_utterance_id,
+                                    })
+                                except asyncio.QueueFull:
+                                    pass
+                        else:
+                            try:
+                                state["tts_queue"].put_nowait({
+                                    "text": "",
+                                    "end": True,
+                                    "utterance_id": ending_utterance_id,
+                                })
+                            except asyncio.QueueFull:
+                                pass
 
                         await ws.send_json({
                             "type": "transcript",
