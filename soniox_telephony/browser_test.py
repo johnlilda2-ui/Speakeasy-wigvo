@@ -176,7 +176,9 @@ async def browser_translation(ws: WebSocket) -> None:
     try:
         cfg = await ws.receive_json()
         source, target, voice = resolve_languages(cfg)
-        if source == target:
+        tts_only = str(cfg.get("mode") or "").strip().lower() == "tts_only"
+
+        if source == target and not tts_only:
             await ws.send_json({
                 "type": "error",
                 "stage": "config",
@@ -208,10 +210,10 @@ async def browser_translation(ws: WebSocket) -> None:
                     {"key": "domain", "value": "live conversation"},
                 ],
             },
-            "translation": {
+            **({"translation": {
                 "type": "one_way",
                 "target_language": target,
-            },
+            }} if not tts_only else {}),
         }))
 
         tts_ws = await websockets.connect(
@@ -227,10 +229,12 @@ async def browser_translation(ws: WebSocket) -> None:
             "translation_seq": 0,
             "target": target,
             "voice": voice,
+            "tts_only": tts_only,
             "final_translation": "",
             "translation_partial": "",
             "translation_prev_hypothesis": "",
             "translation_tts_sent": 0,
+            "tts_only_sent": 0,
             "spoken_chars": 0,
             "tts_queue": asyncio.Queue(maxsize=32),
             "tts_done": {},
@@ -404,6 +408,36 @@ async def browser_translation(ws: WebSocket) -> None:
                                 final_original += token_text
                             else:
                                 preview_original.append(token_text)
+
+                            if state.get("tts_only"):
+                                tts_candidate = final_original + "".join(preview_original)
+                                sent = int(state.get("tts_only_sent", 0))
+                                if len(tts_candidate) > sent:
+                                    delta = tts_candidate[sent:]
+                                    boundary = -1
+                                    for i, ch in enumerate(delta):
+                                        if ch in " ,.!?:;":
+                                            boundary = i
+                                            break
+                                    if boundary >= 0:
+                                        chunk = delta[:boundary + 1].strip()
+                                        if len(chunk) >= 2:
+                                            try:
+                                                state["tts_queue"].put_nowait({
+                                                    "text": chunk,
+                                                    "end": False,
+                                                    "utterance_id": state["utterance_id"],
+                                                })
+                                                state["tts_only_sent"] = sent + boundary + 1
+                                                state["translation_seq"] += 1
+                                                await ws.send_json({
+                                                    "type": "tts_text",
+                                                    "text": chunk,
+                                                    "final": False,
+                                                    "chunk_id": f"tts-{state['translation_seq']}",
+                                                })
+                                            except asyncio.QueueFull:
+                                                pass
                         elif status == "translation":
                             timing = state["timings"].get(state["utterance_id"])
                             if timing is not None and timing["first_translation_token_at"] is None:
@@ -540,6 +574,7 @@ async def browser_translation(ws: WebSocket) -> None:
                         state["translation_partial"] = ""
                         state["translation_prev_hypothesis"] = ""
                         state["translation_tts_sent"] = 0
+                        state["tts_only_sent"] = 0
                         state["spoken_chars"] = 0
                         state["speech_started_at"] = None
                         state["first_translation_token_at"] = None
@@ -691,18 +726,18 @@ main{width:min(720px,100%);margin:auto}.card{background:rgba(16,25,45,.9);border
 .brand{display:flex;align-items:center;gap:10px}.logo{width:44px;height:44px;border-radius:13px;background:#eef2ff;color:#0b1324;display:grid;place-items:center;font-weight:900}.title{margin:0;font-size:23px}.muted{color:#9daaca;font-size:13px}.sub{color:#b9c4dc;font-size:13px}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.field{margin-top:10px}.field label{display:block;font-size:12px;color:#aeb9d2;margin-bottom:5px}.field input,.field select,button{width:100%;padding:12px;border-radius:11px;border:1px solid #40527a;background:#0d1527;color:#fff;font-size:15px}button{font-weight:750}.primary{background:#315fe9;border-color:#315fe9}.danger{background:#6b2940;border-color:#6b2940}button:disabled{opacity:.45}.status{margin-top:12px;padding:10px;border-radius:11px;background:#0b1324}.orb{width:128px;height:128px;margin:10px auto;border-radius:50%;background:radial-gradient(circle at 35% 30%,#425b89,#152544 52%,#0a1120);box-shadow:0 18px 45px rgba(0,0,0,.35)}.orb.speaking{animation:pulse 1.15s infinite}.call{text-align:center}.direction{font-size:18px;font-weight:800}.room{font-size:12px;color:#9daaca;margin-top:4px}.meter{height:6px;background:#0c1425;border-radius:20px;overflow:hidden;margin-top:14px}.meter i{display:block;height:100%;width:0;background:#6f8fff}.box{background:#0b1324;border-radius:12px;padding:12px;min-height:56px;margin-top:7px;line-height:1.5}.translated{font-size:18px;font-weight:650}.controls{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}.log{font:11px ui-monospace,monospace;color:#8f9dbb;max-height:130px;overflow:auto;white-space:pre-wrap}.note{font-size:11px;color:#93a2bd;line-height:1.4;margin-top:9px}.error{color:#ff9eaf}@keyframes pulse{50%{transform:scale(1.04)}}@media(max-width:600px){.row{grid-template-columns:1fr}.card{padding:14px}}
 </style></head>
 <body><main>
-<div class="card"><div class="brand"><div class="logo">S</div><div><h1 class="title">SpeakEasy</h1><div class="sub">Live voice call — no translation</div></div><span class="muted" style="margin-left:auto">Agora voice</span></div></div>
+<div class="card"><div class="brand"><div class="logo">S</div><div><h1 class="title">SpeakEasy</h1><div class="sub">Live voice call — TTS voice test</div></div><span class="muted" style="margin-left:auto">Agora + Soniox TTS</span></div></div>
 <div class="card">
 <div class="row"><div class="field"><label>Room code</label><input id="room" value="demo-room" autocomplete="off"></div>
 <div class="field"><label>Language</label><select id="src"><option value="en">English</option></select></div></div>
 <div class="field"><label>Call audio</label><select id="tgt"><option value="en">English voice</option></select></div>
-<div class="note">Both people use the same room code. Your microphone is sent directly to Agora. No Soniox translation and no TTS are used in this test.</div>
+<div class="note">Both people use the same room code. Your microphone is converted to a different English voice by Soniox TTS before it is sent to Agora. Translation is disabled for this test.</div>
 <audio id="playback" autoplay playsinline style="display:none"></audio><div class="controls"><button id="start" class="primary">Start call</button><button id="stop" class="danger" disabled>End call</button></div>
 <div class="status"><span id="status">Ready</span><span id="uid" class="muted" style="float:right"></span></div>
 </div>
 <div class="card call"><div id="orb" class="orb"></div><div id="dir" class="direction">Not connected</div><div id="roomline" class="room">Choose languages and start</div><div class="meter"><i id="meter"></i></div></div>
-<div class="card"><div class="muted">Live voice</div><div id="original" class="box">Your real microphone audio is sent directly through Agora.</div><div class="muted" style="margin-top:12px">Audio path</div><div id="translated" class="box translated">Microphone → Agora → remote speaker</div></div>
-<div class="card"><div class="muted">Voice test</div><div id="rawStt" class="box">STT, translation and TTS are bypassed.</div><div id="sttMeta" class="note">Testing only the live Agora voice path.</div></div>
+<div class="card"><div class="muted">Live voice</div><div id="original" class="box">Your real microphone audio is sent directly through Agora.</div><div class="muted" style="margin-top:12px">Audio path</div><div id="translated" class="box translated">Microphone → Soniox STT → Soniox TTS → Agora → remote speaker</div></div>
+<div class="card"><div class="muted">Voice test</div><div id="rawStt" class="box">English speech is recognized and regenerated with the Soniox TTS voice “Adrian”. Translation is disabled.</div><div id="sttMeta" class="note">Testing the live voice-conversion path.</div></div>
 <div class="card"><div class="muted">Session log</div><div id="log" class="log"></div></div>
 </main>
 <script>
@@ -789,15 +824,58 @@ async function startCall(){
     await c.join(config.agora_app_id,channelName,tokenJson.token,uid);
     if(!starting)throw new Error("Call was stopped while connecting");
 
-    localTrack=await AgoraRTC.createMicrophoneAudioTrack({encoderConfig:"speech_low_quality",AEC:true,ANS:true,AGC:true});
-    if(!starting)throw new Error("Call was stopped while creating microphone");
+    stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
+    if(!starting)throw new Error("Call was stopped while opening microphone");
+
+    ws=new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+"/api/browser");
+    await new Promise((resolve,reject)=>{
+      ws.onopen=resolve;
+      ws.onerror=()=>reject(new Error("Could not connect to Soniox voice pipeline"));
+    });
+    ws.onmessage=async(ev)=>{
+      try{
+        const data=JSON.parse(ev.data);
+        if(data.type==="ready"){write("Soniox TTS-only pipeline ready");return}
+        if(data.type==="error"){write("["+data.stage+"] "+data.message);return}
+        if(data.type==="tts_text"){write("TTS: "+data.text);return}
+        if(data.type==="audio"){
+          playTranslated(data.audio,data.sample_rate||24000);
+          audioAt=performance.now();
+          if(!timingAudioShown){timingAudioShown=true;renderTiming()}
+        }
+      }catch(e){write("Pipeline message error: "+(e?.message||e))}
+    };
+    ws.send(JSON.stringify({mode:"tts_only",language:"en",target_language:"en",voice:"Adrian"}));
+
+    playCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:24000});
+    await playCtx.resume();
+    outDestination=playCtx.createMediaStreamDestination();
+
+    micCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000});
+    await micCtx.resume();
+    const sourceNode=micCtx.createMediaStreamSource(stream);
+    const gain=micCtx.createGain();
+    processor=micCtx.createScriptProcessor(4096,1,1);
+    silent=micCtx.createGain();
+    silent.gain.value=0;
+    sourceNode.connect(gain);
+    gain.connect(processor);
+    processor.connect(silent);
+    silent.connect(micCtx.destination);
+    processor.onaudioprocess=(ev)=>{
+      if(!ws||ws.readyState!==WebSocket.OPEN)return;
+      const samples=ev.inputBuffer.getChannelData(0);
+      const bytes=pcm(down(samples,micCtx.sampleRate,16000)).buffer;
+      micPackets++;
+      micBytes+=bytes.byteLength;
+      try{ws.send(bytes)}catch(e){}
+    };
+
+    const outTrack=outDestination.stream.getAudioTracks()[0];
+    localTrack=AgoraRTC.createCustomAudioTrack({mediaStreamTrack:outTrack,encoderConfig:"speech_low_quality"});
+    if(!starting)throw new Error("Call was stopped while preparing TTS audio");
     await c.publish([localTrack]);
 
-    // A remote user may have published before this client finished joining
-    // or while this client was still creating/publishing its microphone.
-    // In that case the user-published callback can arrive before running=true.
-    // Scan the SDK's current remote-user list after our own publish so that
-    // an already-published microphone is never missed.
     for(const user of (c.remoteUsers||[])){
       await subscribeRemoteAudio(user);
     }
@@ -809,8 +887,8 @@ async function startCall(){
     $("roomline").textContent="Room: "+roomName($("room").value);
     $("orb").classList.add("speaking");$("meter").style.width="0%";
     setStatus("Live voice connected");
-    write("Agora joined "+channelName+" — microphone audio only");
-    write("Translation and TTS are disabled for this test");
+    write("Agora joined "+channelName+" — publishing Soniox TTS audio");
+    write("English → English voice conversion test; translation disabled");
     setTimeout(()=>{if(running)$("orb").classList.remove("speaking")},700);
     $("stop").disabled=false;
   }catch(e){
