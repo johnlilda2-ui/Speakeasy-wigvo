@@ -44,23 +44,65 @@ async def send_tts(tts_ws: Any, state: dict[str, Any], text: str) -> None:
     text = text.strip()
     if not text or tts_ws is None:
         return
-    async with state["send_lock"]:
-        state["seq"] += 1
-        sid = f"browser-{state['seq']}-{uuid4().hex[:8]}"
-        await tts_ws.send(json.dumps({
-            "api_key": SONIOX_API_KEY,
-            "model": SONIOX_TTS_MODEL,
-            "language": state["target"],
-            "voice": state["voice"],
-            "audio_format": "pcm_s16le",
-            "sample_rate": 24000,
-            "stream_id": sid,
-        }))
-        await tts_ws.send(json.dumps({
-            "stream_id": sid,
-            "text": text,
-            "text_end": True,
-        }))
+
+    # Soniox permits multiple multiplexed streams, but our organization may
+    # have a lower concurrent TTS-request limit.  The caller therefore puts
+    # work through a single per-session worker instead of starting requests
+    # concurrently.
+    await state["tts_queue"].put(text)
+
+
+async def tts_worker(tts_ws: Any, state: dict[str, Any]) -> None:
+    while True:
+        text = await state["tts_queue"].get()
+        try:
+            if not text or tts_ws is None:
+                continue
+
+            state["seq"] += 1
+            sid = f"browser-{state['seq']}-{uuid4().hex[:8]}"
+            done = asyncio.Event()
+            state["tts_done"][sid] = done
+
+            await tts_ws.send(json.dumps({
+                "api_key": SONIOX_API_KEY,
+                "model": SONIOX_TTS_MODEL,
+                "language": state["target"],
+                "voice": state["voice"],
+                "audio_format": "pcm_s16le",
+                "sample_rate": 24000,
+                "stream_id": sid,
+            }))
+            await tts_ws.send(json.dumps({
+                "stream_id": sid,
+                "text": text,
+                "text_end": True,
+            }))
+
+            # Do not start another TTS stream until Soniox has sent the
+            # terminal {"terminated": true} event for this one.
+            await asyncio.wait_for(done.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            await state["owner_ws"].send_json({
+                "type": "error",
+                "stage": "tts",
+                "message": "Soniox TTS stream timed out before termination.",
+            })
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            try:
+                await state["owner_ws"].send_json({
+                    "type": "error",
+                    "stage": "tts",
+                    "message": str(exc),
+                })
+            except Exception:
+                pass
+        finally:
+            if "sid" in locals():
+                state["tts_done"].pop(sid, None)
+            state["tts_queue"].task_done()
 
 
 async def browser_translation(ws: WebSocket) -> None:
@@ -76,7 +118,6 @@ async def browser_translation(ws: WebSocket) -> None:
 
     stt_ws = tts_ws = None
     tasks: list[asyncio.Task] = []
-    tts_tasks: set[asyncio.Task] = set()
     started = time.monotonic()
 
     try:
@@ -131,7 +172,9 @@ async def browser_translation(ws: WebSocket) -> None:
             "voice": voice,
             "final_translation": "",
             "spoken_chars": 0,
-            "send_lock": asyncio.Lock(),
+            "tts_queue": asyncio.Queue(maxsize=8),
+            "tts_done": {},
+            "owner_ws": ws,
         }
         final_original = ""
         speech_started = False
@@ -174,9 +217,15 @@ async def browser_translation(ws: WebSocket) -> None:
                 return ""
 
             state["translation_seq"] += 1
-            task = asyncio.create_task(send_tts(tts_ws, state, chunk))
-            tts_tasks.add(task)
-            task.add_done_callback(tts_tasks.discard)
+            try:
+                state["tts_queue"].put_nowait(chunk)
+            except asyncio.QueueFull:
+                # Preserve the newest translation without opening another
+                # concurrent Soniox TTS request. The serial worker drains the
+                # queue in order; dropping only an already-queued chunk is
+                # preferable to exceeding the provider concurrency limit.
+                awaitable = state["tts_queue"].put(chunk)
+                asyncio.create_task(awaitable)
             return chunk
 
         async def read_stt() -> None:
@@ -288,6 +337,9 @@ async def browser_translation(ws: WebSocket) -> None:
                             "message": data.get("error_message", "Soniox TTS error"),
                             "stream_id": sid,
                         })
+                        done = state["tts_done"].get(sid)
+                        if done:
+                            done.set()
                         continue
 
                     audio = data.get("audio")
@@ -298,12 +350,18 @@ async def browser_translation(ws: WebSocket) -> None:
                             "sample_rate": 24000,
                             "stream_id": sid,
                         })
+
+                    if data.get("terminated"):
+                        done = state["tts_done"].get(sid)
+                        if done:
+                            done.set()
             except asyncio.CancelledError:
                 pass
 
         tasks.extend([
             asyncio.create_task(read_stt()),
             asyncio.create_task(read_tts()),
+            asyncio.create_task(tts_worker(tts_ws, state)),
         ])
 
         async def keepalive() -> None:
@@ -360,8 +418,6 @@ async def browser_translation(ws: WebSocket) -> None:
             pass
     finally:
         for task in tasks:
-            task.cancel()
-        for task in tuple(tts_tasks):
             task.cancel()
         for sock in (stt_ws, tts_ws):
             if sock:
