@@ -53,26 +53,29 @@ async def send_tts(tts_ws: Any, state: dict[str, Any], text: str, *, end: bool =
 
 
 async def tts_worker(tts_ws: Any, state: dict[str, Any]) -> None:
-    active_sid: str | None = None
-    active_done: asyncio.Event | None = None
-
-    async def ensure_stream() -> bool:
-        nonlocal active_sid, active_done
+    # Soniox supports multiple concurrent streams on one TTS websocket.
+    # Keep each utterance on its own stream so a finished turn never blocks
+    # the next turn while its final audio/termination is still arriving.
+    async def ensure_stream(utterance_id: int) -> str | None:
         if tts_ws is None:
-            return False
+            return None
 
-        if active_sid and active_done and active_done.is_set():
-            state["tts_done"].pop(active_sid, None)
-            active_sid = None
-            active_done = None
-
-        if active_sid is not None:
-            return True
+        for sid, info in list(state["tts_streams"].items()):
+            if info["utterance_id"] == utterance_id:
+                done = info["done"]
+                if not done.is_set():
+                    return sid
+                state["tts_streams"].pop(sid, None)
+                state["tts_done"].pop(sid, None)
 
         state["seq"] += 1
-        active_sid = f"browser-{state['seq']}-{uuid4().hex[:8]}"
-        active_done = asyncio.Event()
-        state["tts_done"][active_sid] = active_done
+        sid = f"browser-{state['seq']}-{uuid4().hex[:8]}"
+        done = asyncio.Event()
+        state["tts_streams"][sid] = {
+            "done": done,
+            "utterance_id": utterance_id,
+        }
+        state["tts_done"][sid] = done
 
         await tts_ws.send(json.dumps({
             "api_key": SONIOX_API_KEY,
@@ -81,9 +84,9 @@ async def tts_worker(tts_ws: Any, state: dict[str, Any]) -> None:
             "voice": state["voice"],
             "audio_format": "pcm_s16le",
             "sample_rate": 24000,
-            "stream_id": active_sid,
+            "stream_id": sid,
         }))
-        return True
+        return sid
 
     while True:
         item = await state["tts_queue"].get()
@@ -94,17 +97,22 @@ async def tts_worker(tts_ws: Any, state: dict[str, Any]) -> None:
             text = str(item.get("text") or "").strip()
             end = bool(item.get("end"))
             prepare = bool(item.get("prepare"))
+            utterance_id = int(
+                item.get("utterance_id") or state.get("utterance_id") or 0
+            )
 
-            if not await ensure_stream():
+            sid = await ensure_stream(utterance_id)
+            if sid is None:
                 continue
 
             if prepare:
-                # Prepare the per-utterance stream as soon as speech begins.
+                # The stream is already open before the first translated
+                # chunk arrives, reducing TTS startup latency.
                 continue
 
             if text:
                 await tts_ws.send(json.dumps({
-                    "stream_id": active_sid,
+                    "stream_id": sid,
                     "text": text,
                     "text_end": end,
                 }))
@@ -123,24 +131,13 @@ async def tts_worker(tts_ws: Any, state: dict[str, Any]) -> None:
                         pass
             elif end:
                 await tts_ws.send(json.dumps({
-                    "stream_id": active_sid,
+                    "stream_id": sid,
                     "text": "",
                     "text_end": True,
                 }))
-
-            if end and active_done:
-                try:
-                    await asyncio.wait_for(active_done.wait(), timeout=30)
-                except asyncio.TimeoutError:
-                    await state["owner_ws"].send_json({
-                        "type": "error",
-                        "stage": "tts",
-                        "message": "Soniox TTS stream timed out before termination.",
-                    })
-                finally:
-                    state["tts_done"].pop(active_sid, None)
-                    active_sid = None
-                    active_done = None
+                # Do not wait here. The translated audio already queued by
+                # the browser must continue playing, while the next speech
+                # turn is allowed to open its own Soniox stream immediately.
 
         except asyncio.CancelledError:
             raise
@@ -153,13 +150,11 @@ async def tts_worker(tts_ws: Any, state: dict[str, Any]) -> None:
                 })
             except Exception:
                 pass
-            if active_sid:
-                state["tts_done"].pop(active_sid, None)
-                active_sid = None
-                active_done = None
         finally:
             state["tts_queue"].task_done()
 
+
+async def browser_translation
 
 async def browser_translation(ws: WebSocket) -> None:
     await ws.accept()
@@ -237,6 +232,8 @@ async def browser_translation(ws: WebSocket) -> None:
             "spoken_chars": 0,
             "tts_queue": asyncio.Queue(maxsize=32),
             "tts_done": {},
+            "tts_streams": {},
+            "utterance_id": 0,
             "owner_ws": ws,
             "speech_started_at": None,
             "first_translation_token_at": None,
@@ -364,18 +361,32 @@ async def browser_translation(ws: WebSocket) -> None:
                             continue
 
                         if status in (None, "none", "original"):
+                            # Treat the first recognized original token as the
+                            # start of a new speech turn regardless of whether
+                            # Soniox marks that token final or partial. This
+                            # keeps speech capture independent from TTS playout.
+                            if not speech_started:
+                                speech_started = True
+                                state["utterance_id"] += 1
+                                state["speech_started_at"] = time.monotonic()
+                                try:
+                                    state["tts_queue"].put_nowait({
+                                        "prepare": True,
+                                        "text": "",
+                                        "end": False,
+                                        "utterance_id": state["utterance_id"],
+                                    })
+                                except asyncio.QueueFull:
+                                    pass
+                                await ws.send_json({
+                                    "type": "speech_start",
+                                    "utterance_id": state["utterance_id"],
+                                })
+
                             if is_final:
                                 final_original += token_text
                             else:
                                 preview_original.append(token_text)
-                                if not speech_started:
-                                    speech_started = True
-                                    state["speech_started_at"] = time.monotonic()
-                                    try:
-                                        state["tts_queue"].put_nowait({"prepare": True, "text": "", "end": False})
-                                    except asyncio.QueueFull:
-                                        pass
-                                    await ws.send_json({"type": "speech_start"})
                         elif status == "translation":
                             if state["first_translation_token_at"] is None:
                                 state["first_translation_token_at"] = time.monotonic()
@@ -418,7 +429,11 @@ async def browser_translation(ws: WebSocket) -> None:
                             chunk = final_delta[:cut].strip()
                             if len(chunk) >= 2:
                                 try:
-                                    state["tts_queue"].put_nowait({"text": chunk, "end": False})
+                                    state["tts_queue"].put_nowait({
+                                        "text": chunk,
+                                        "end": False,
+                                        "utterance_id": state["utterance_id"],
+                                    })
                                     state["translation_tts_sent"] = final_sent + cut
                                     state["translation_seq"] += 1
                                     await ws.send_json({
@@ -473,20 +488,32 @@ async def browser_translation(ws: WebSocket) -> None:
                         })
 
                     if endpoint:
-                        # Close the current TTS stream only at the utterance
-                        # boundary. Earlier stable translation chunks stayed on
-                        # the same stream and could already produce audio.
+                        # Finish only the TTS stream belonging to this speech
+                        # turn. The worker does not wait for termination, so a
+                        # new turn can be captured and translated immediately.
+                        ending_utterance_id = state["utterance_id"]
+                        completed_original = (
+                            final_original + "".join(preview_original)
+                        ).strip()
                         try:
-                            state["tts_queue"].put_nowait({"text": "", "end": True})
+                            state["tts_queue"].put_nowait({
+                                "text": "",
+                                "end": True,
+                                "utterance_id": ending_utterance_id,
+                            })
                         except asyncio.QueueFull:
                             pass
 
                         await ws.send_json({
                             "type": "transcript",
-                            "text": final_original.strip(),
+                            "text": completed_original,
                             "final": True,
+                            "utterance_id": ending_utterance_id,
                         })
-                        await ws.send_json({"type": "utterance_end"})
+                        await ws.send_json({
+                            "type": "utterance_end",
+                            "utterance_id": ending_utterance_id,
+                        })
 
                         final_original = ""
                         speech_started = False
