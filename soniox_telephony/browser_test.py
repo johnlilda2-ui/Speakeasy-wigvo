@@ -154,8 +154,6 @@ async def tts_worker(tts_ws: Any, state: dict[str, Any]) -> None:
             state["tts_queue"].task_done()
 
 
-async def browser_translation
-
 async def browser_translation(ws: WebSocket) -> None:
     await ws.accept()
     if not SONIOX_API_KEY:
