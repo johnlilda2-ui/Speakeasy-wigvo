@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import os
 import time
-from uuid import uuid4
 from typing import Any
+from uuid import uuid4
 
 import websockets
 from fastapi import WebSocket, WebSocketDisconnect
@@ -16,124 +15,172 @@ SONIOX_STT_URL = os.getenv("SONIOX_STT_URL", "wss://stt-rt.soniox.com/transcribe
 SONIOX_TTS_URL = os.getenv("SONIOX_TTS_URL", "wss://tts-rt.soniox.com/tts-websocket")
 SONIOX_STT_MODEL = os.getenv("SONIOX_STT_MODEL", "stt-rt-v5")
 SONIOX_TTS_MODEL = os.getenv("SONIOX_TTS_MODEL", "tts-rt-v2")
-SONIOX_ENDPOINT_DELAY_MS = max(500, min(1000, int(os.getenv("SONIOX_ENDPOINT_DELAY_MS", "700"))))
+SONIOX_ENDPOINT_DELAY_MS = max(300, min(1500, int(os.getenv("SONIOX_ENDPOINT_DELAY_MS", "500"))))
 SONIOX_TTS_VOICE_A = os.getenv("SONIOX_TTS_VOICE_A", "Maya")
 SONIOX_TTS_VOICE_B = os.getenv("SONIOX_TTS_VOICE_B", "Adrian")
 
-async def _send_tts_text(
-    tts_ws: Any,
-    state: dict[str, Any],
-    text: str = "",
-    text_end: bool = True,
-) -> str:
-    """Speak one translated chunk on its own short Soniox TTS stream.
+AGORA_APP_ID = os.getenv("AGORA_APP_ID", "").strip()
+AGORA_SDK_VERSION = os.getenv("AGORA_SDK_VERSION", "4.24.8").strip()
+AGORA_CHANNEL_PREFIX = os.getenv("AGORA_CHANNEL_PREFIX", "speakeasy-").strip() or "speakeasy-"
 
-    Every chunk is finalized immediately. This is intentional: Soniox terminates
-    a stream that receives no text for a few seconds while text_end is false.
-    Short finalized streams avoid request_timeout while browser playback queues
-    each audio stream in arrival order. New source speech never cancels them.
-    """
+
+def resolve_languages(cfg: dict[str, Any]) -> tuple[str, str, str]:
+    source = str(cfg.get("language") or "").lower().strip()
+    target = str(cfg.get("target_language") or "").lower().strip()
+    voice = str(cfg.get("voice") or "").strip()
+    if not source or not target:
+        a = str(cfg.get("language_a") or "en").lower().strip()
+        b = str(cfg.get("language_b") or "pt").lower().strip()
+        if str(cfg.get("direction") or "a_to_b") == "b_to_a":
+            source, target = b, a
+        else:
+            source, target = a, b
+    if not voice:
+        voice = SONIOX_TTS_VOICE_A if target in {"en", "ko"} else SONIOX_TTS_VOICE_B
+    return source, target, voice
+
+
+async def send_tts(tts_ws: Any, state: dict[str, Any], text: str) -> None:
     text = text.strip()
-    if not text:
-        return ""
-
-    async with state["lock"]:
+    if not text or tts_ws is None:
+        return
+    async with state["send_lock"]:
         state["seq"] += 1
-        stream_id = f"browser-{state['seq']}-{uuid4().hex[:8]}"
-        state["active"].add(stream_id)
-        state["stream_started_at"][stream_id] = time.monotonic()
-        state["first_audio_logged"].discard(stream_id)
-
+        sid = f"browser-{state['seq']}-{uuid4().hex[:8]}"
         await tts_ws.send(json.dumps({
             "api_key": SONIOX_API_KEY,
             "model": SONIOX_TTS_MODEL,
-            "language": state["target_language"],
+            "language": state["target"],
             "voice": state["voice"],
             "audio_format": "pcm_s16le",
             "sample_rate": 24000,
-            "stream_id": stream_id,
+            "stream_id": sid,
         }))
         await tts_ws.send(json.dumps({
-            "stream_id": stream_id,
+            "stream_id": sid,
             "text": text,
-            "text_end": text_end,
+            "text_end": True,
         }))
-        print(
-            f"[tts] open+text stream={stream_id} end={text_end} chars={len(text)}",
-            flush=True,
-        )
-        return stream_id
+
 
 async def browser_translation(ws: WebSocket) -> None:
     await ws.accept()
-
     if not SONIOX_API_KEY:
-        await ws.send_json({"type": "error", "stage": "config", "message": "SONIOX_API_KEY is not configured on Render."})
+        await ws.send_json({
+            "type": "error",
+            "stage": "config",
+            "message": "SONIOX_API_KEY is not configured on Render.",
+        })
         await ws.close(code=1011)
         return
 
-    stt_ws = None
-    tts_ws = None
-    stt_task = None
-    tts_task = None
-    keepalive_task = None
+    stt_ws = tts_ws = None
+    tasks: list[asyncio.Task] = []
+    tts_tasks: set[asyncio.Task] = set()
     started = time.monotonic()
 
     try:
         cfg = await ws.receive_json()
-        language_a = str(cfg.get("language_a", "en")).lower()
-        language_b = str(cfg.get("language_b", "pt")).lower()
-        direction = str(cfg.get("direction", "a_to_b"))
+        source, target, voice = resolve_languages(cfg)
+        if source == target:
+            await ws.send_json({
+                "type": "error",
+                "stage": "config",
+                "message": "Source and target languages must be different.",
+            })
+            await ws.close(code=1008)
+            return
 
-        if direction == "b_to_a":
-            source_language, target_language, voice = language_b, language_a, SONIOX_TTS_VOICE_A
-        else:
-            source_language, target_language, voice = language_a, language_b, SONIOX_TTS_VOICE_B
-
-        stt_ws = await websockets.connect(SONIOX_STT_URL, ping_interval=20, ping_timeout=20, close_timeout=5)
+        stt_ws = await websockets.connect(
+            SONIOX_STT_URL,
+            ping_interval=20,
+            ping_timeout=20,
+            close_timeout=5,
+            max_size=8 * 1024 * 1024,
+        )
         await stt_ws.send(json.dumps({
             "api_key": SONIOX_API_KEY,
             "model": SONIOX_STT_MODEL,
             "audio_format": "pcm_s16le",
             "sample_rate": 16000,
             "num_channels": 1,
-            "language_hints": [source_language],
+            "language_hints": [source],
             "language_hints_strict": True,
             "enable_endpoint_detection": True,
             "endpoint_latency_adjustment_level": 2,
             "endpoint_sensitivity": 0.3,
-            "max_endpoint_delay_ms": min(1000, SONIOX_ENDPOINT_DELAY_MS),
-            "translation": {"type": "one_way", "target_language": target_language},
+            "max_endpoint_delay_ms": SONIOX_ENDPOINT_DELAY_MS,
+            "translation": {
+                "type": "one_way",
+                "target_language": target,
+            },
         }))
 
-        tts_ws = await websockets.connect(SONIOX_TTS_URL, ping_interval=20, ping_timeout=20, close_timeout=5)
-        tts_state = {
+        tts_ws = await websockets.connect(
+            SONIOX_TTS_URL,
+            ping_interval=20,
+            ping_timeout=20,
+            close_timeout=5,
+            max_size=8 * 1024 * 1024,
+        )
+
+        state: dict[str, Any] = {
             "seq": 0,
-            "active": set(),
-            "lock": asyncio.Lock(),
-            "target_language": target_language,
-            "voice": voice,
-            "spoken_chars": 0,
-            "final_translation": "",
-            "last_translation_candidate": "",
             "translation_seq": 0,
-            "stream_started_at": {},
-            "first_audio_logged": set(),
+            "target": target,
+            "voice": voice,
+            "final_translation": "",
+            "spoken_chars": 0,
+            "send_lock": asyncio.Lock(),
         }
-        translation_seq = 0
         final_original = ""
-        non_final_original = ""
-        translation_to_speak = ""
         speech_started = False
 
         await ws.send_json({
             "type": "ready",
-            "source_language": source_language,
-            "target_language": target_language,
+            "source_language": source,
+            "target_language": target,
         })
 
+        def emit_final_translation(force: bool = False) -> str:
+            candidate = state["final_translation"]
+            spoken = int(state["spoken_chars"])
+            if len(candidate) <= spoken:
+                return ""
+
+            delta = candidate[spoken:]
+            boundary = max(
+                delta.rfind(" "),
+                delta.rfind(","),
+                delta.rfind("."),
+                delta.rfind("?"),
+                delta.rfind("!"),
+                delta.rfind(":"),
+                delta.rfind(";"),
+            )
+
+            if force and boundary < 0:
+                chunk = delta.strip()
+                if not chunk:
+                    return ""
+                state["spoken_chars"] = len(candidate)
+            elif boundary >= 3:
+                cut = boundary + 1
+                chunk = delta[:cut].strip()
+                if not chunk or (not force and len(chunk) < 6):
+                    return ""
+                state["spoken_chars"] = spoken + cut
+            else:
+                return ""
+
+            state["translation_seq"] += 1
+            task = asyncio.create_task(send_tts(tts_ws, state, chunk))
+            tts_tasks.add(task)
+            task.add_done_callback(tts_tasks.discard)
+            return chunk
+
         async def read_stt() -> None:
-            nonlocal final_original, non_final_original, speech_started
+            nonlocal final_original, speech_started
             try:
                 async for raw in stt_ws:
                     data = json.loads(raw)
@@ -145,43 +192,42 @@ async def browser_translation(ws: WebSocket) -> None:
                         })
                         continue
 
-                    response_non_final_original = []
-                    response_non_final_translation = []
-                    saw_endpoint = False
+                    preview_original: list[str] = []
+                    preview_translation: list[str] = []
+                    endpoint = False
+                    chunks: list[tuple[str, int]] = []
 
                     for token in data.get("tokens") or []:
-                        text = str(token.get("text") or "")
+                        token_text = str(token.get("text") or "")
                         status = token.get("translation_status")
                         is_final = bool(token.get("is_final"))
 
-                        if text == "<end>":
-                            saw_endpoint = True
+                        if token_text == "<end>":
+                            endpoint = True
                             continue
-                        if not text:
+                        if not token_text:
                             continue
 
                         if status in (None, "none", "original"):
                             if is_final:
-                                final_original += text
+                                final_original += token_text
                             else:
-                                response_non_final_original.append(text)
+                                preview_original.append(token_text)
                                 if not speech_started:
                                     speech_started = True
-                                    # Do NOT clear current translated audio here.
-                                    # Browser playback is queued so the current chunk
-                                    # can finish while the next phrase is recognized.
                                     await ws.send_json({"type": "speech_start"})
-
                         elif status == "translation":
                             if is_final:
-                                tts_state["final_translation"] += text
+                                state["final_translation"] += token_text
+                                chunk = emit_final_translation(False)
+                                if chunk:
+                                    chunks.append((chunk, state["translation_seq"]))
                             else:
-                                # Non-final translation is a replaceable snapshot for
-                                # this response. It must never be append-only.
-                                response_non_final_translation.append(text)
+                                preview_translation.append(token_text)
 
-                    non_final_original = "".join(response_non_final_original)
-                    current_original = (final_original + non_final_original).strip()
+                    current_original = (
+                        final_original + "".join(preview_original)
+                    ).strip()
                     if current_original:
                         await ws.send_json({
                             "type": "transcript",
@@ -189,73 +235,29 @@ async def browser_translation(ws: WebSocket) -> None:
                             "final": False,
                         })
 
-                    provisional_translation = "".join(response_non_final_translation)
-                    candidate = (tts_state["final_translation"] + provisional_translation).strip()
-
-                    if candidate:
-                        previous = tts_state["last_translation_candidate"]
-                        common_len = 0
-                        limit = min(len(previous), len(candidate))
-                        while common_len < limit and previous[common_len] == candidate[common_len]:
-                            common_len += 1
-
-                        # If the candidate is unchanged from the previous update,
-                        # its existing prefix is now stable enough to speak. We use
-                        # natural word boundaries so we never synthesize half a word.
-                        stable_end = common_len
-                        boundary = max(
-                            candidate[:stable_end].rfind(" "),
-                            candidate[:stable_end].rfind(","),
-                            candidate[:stable_end].rfind("."),
-                            candidate[:stable_end].rfind("?"),
-                            candidate[:stable_end].rfind("!"),
-                            candidate[:stable_end].rfind(":"),
-                            candidate[:stable_end].rfind(";"),
-                        )
-
-                        if boundary >= tts_state["spoken_chars"] + 8:
-                            chunk = candidate[tts_state["spoken_chars"]:boundary + 1].strip()
-                            if chunk:
-                                tts_state["spoken_chars"] = boundary + 1
-                                translation_seq = tts_state["translation_seq"] + 1
-                                tts_state["translation_seq"] = translation_seq
-                                await _send_tts_text(tts_ws, tts_state, chunk, text_end=True)
-                                await ws.send_json({
-                                    "type": "translation_text",
-                                    "text": chunk,
-                                    "final": True,
-                                    "chunk_id": f"tr-{translation_seq}",
-                                })
-
-                    tts_state["last_translation_candidate"] = candidate
-
-                    if response_non_final_translation:
+                    if preview_translation:
                         await ws.send_json({
                             "type": "translation_preview",
-                            "text": provisional_translation,
+                            "text": "".join(preview_translation),
                         })
 
-                    if saw_endpoint:
-                        final_candidate = tts_state["final_translation"].strip()
-                        if len(final_candidate) > tts_state["spoken_chars"]:
-                            chunk = final_candidate[tts_state["spoken_chars"]:].strip()
-                            if chunk:
-                                tts_state["spoken_chars"] = len(final_candidate)
-                                translation_seq = tts_state["translation_seq"] + 1
-                                tts_state["translation_seq"] = translation_seq
-                                await _send_tts_text(tts_ws, tts_state, chunk, text_end=True)
-                                await ws.send_json({
-                                    "type": "translation_text",
-                                    "text": chunk,
-                                    "final": True,
-                                    "chunk_id": f"tr-{translation_seq}",
-                                })
+                    for chunk, seq in chunks:
+                        await ws.send_json({
+                            "type": "translation_text",
+                            "text": chunk,
+                            "final": True,
+                            "chunk_id": f"tr-{seq}",
+                        })
 
-                        non_final_original = ""
-                        speech_started = False
-                        tts_state["final_translation"] = ""
-                        tts_state["last_translation_candidate"] = ""
-                        tts_state["spoken_chars"] = 0
+                    if endpoint:
+                        chunk = emit_final_translation(True)
+                        if chunk:
+                            await ws.send_json({
+                                "type": "translation_text",
+                                "text": chunk,
+                                "final": True,
+                                "chunk_id": f"tr-{state['translation_seq']}",
+                            })
 
                         await ws.send_json({
                             "type": "transcript",
@@ -263,6 +265,11 @@ async def browser_translation(ws: WebSocket) -> None:
                             "final": True,
                         })
                         await ws.send_json({"type": "utterance_end"})
+
+                        final_original = ""
+                        speech_started = False
+                        state["final_translation"] = ""
+                        state["spoken_chars"] = 0
 
                     if data.get("finished"):
                         break
@@ -281,8 +288,6 @@ async def browser_translation(ws: WebSocket) -> None:
                             "message": data.get("error_message", "Soniox TTS error"),
                             "stream_id": sid,
                         })
-                        if sid:
-                            tts_state["active"].discard(sid)
                         continue
 
                     audio = data.get("audio")
@@ -293,14 +298,13 @@ async def browser_translation(ws: WebSocket) -> None:
                             "sample_rate": 24000,
                             "stream_id": sid,
                         })
-
-                    if data.get("terminated") and sid:
-                        tts_state["active"].discard(sid)
             except asyncio.CancelledError:
                 pass
 
-        stt_task = asyncio.create_task(read_stt())
-        tts_task = asyncio.create_task(read_tts())
+        tasks.extend([
+            asyncio.create_task(read_stt()),
+            asyncio.create_task(read_tts()),
+        ])
 
         async def keepalive() -> None:
             try:
@@ -310,16 +314,17 @@ async def browser_translation(ws: WebSocket) -> None:
                         await stt_ws.send(json.dumps({"type": "keepalive"}))
                     if tts_ws:
                         await tts_ws.send(json.dumps({"keep_alive": True}))
-            except asyncio.CancelledError:
-                pass
-            except Exception:
+            except (asyncio.CancelledError, Exception):
                 pass
 
-        keepalive_task = asyncio.create_task(keepalive())
+        tasks.append(asyncio.create_task(keepalive()))
 
         while True:
             if time.monotonic() - started > 600:
-                await ws.send_json({"type": "info", "message": "Maximum browser test session reached."})
+                await ws.send_json({
+                    "type": "info",
+                    "message": "Maximum browser call session reached.",
+                })
                 break
 
             msg = await ws.receive()
@@ -328,38 +333,40 @@ async def browser_translation(ws: WebSocket) -> None:
 
             if msg.get("bytes") is not None:
                 audio = msg["bytes"]
-                if audio:
+                if audio and stt_ws:
                     await stt_ws.send(audio)
-
             elif msg.get("text") is not None:
                 try:
-                    command = json.loads(msg["text"])
+                    cmd = json.loads(msg["text"])
                 except json.JSONDecodeError:
-                    command = {}
+                    cmd = {}
 
-                if command.get("type") == "stop":
+                if cmd.get("type") == "stop":
                     break
-
-                if command.get("type") == "barge_in":
-                    # Stop currently queued translated speech at the browser immediately.
-                    # TTS streams are short and will finish/cancel naturally.
-                    await ws.send_json({"type": "clear_audio"})
+                if cmd.get("type") == "barge_in":
+                    # Do not chop already translated audio. Browser/Agora queues it.
+                    await ws.send_json({"type": "keep_audio"})
 
     except WebSocketDisconnect:
         pass
     except Exception as exc:
         try:
-            await ws.send_json({"type": "error", "stage": "server", "message": str(exc)})
+            await ws.send_json({
+                "type": "error",
+                "stage": "server",
+                "message": str(exc),
+            })
         except Exception:
             pass
     finally:
-        for task in (stt_task, tts_task, keepalive_task):
-            if task:
-                task.cancel()
-        for soniox_ws in (stt_ws, tts_ws):
-            if soniox_ws:
+        for task in tasks:
+            task.cancel()
+        for task in tuple(tts_tasks):
+            task.cancel()
+        for sock in (stt_ws, tts_ws):
+            if sock:
                 try:
-                    await soniox_ws.close()
+                    await sock.close()
                 except Exception:
                     pass
         try:
@@ -367,94 +374,78 @@ async def browser_translation(ws: WebSocket) -> None:
         except Exception:
             pass
 
+
+BROWSER_HTML_PAGE = r'''<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>SpeakEasy — Realtime Call</title>
+<meta http-equiv="Cache-Control" content="no-store">
+<style>
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at top,#1b2d52,#080d18 55%);color:#eef2ff;font-family:system-ui,sans-serif;padding:12px}
+main{width:min(720px,100%);margin:auto}.card{background:rgba(16,25,45,.9);border:1px solid rgba(126,153,207,.25);border-radius:20px;padding:16px;margin:10px 0;box-shadow:0 14px 38px rgba(0,0,0,.2)}
+.brand{display:flex;align-items:center;gap:10px}.logo{width:44px;height:44px;border-radius:13px;background:#eef2ff;color:#0b1324;display:grid;place-items:center;font-weight:900}.title{margin:0;font-size:23px}.muted{color:#9daaca;font-size:13px}.sub{color:#b9c4dc;font-size:13px}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.field{margin-top:10px}.field label{display:block;font-size:12px;color:#aeb9d2;margin-bottom:5px}.field input,.field select,button{width:100%;padding:12px;border-radius:11px;border:1px solid #40527a;background:#0d1527;color:#fff;font-size:15px}button{font-weight:750}.primary{background:#315fe9;border-color:#315fe9}.danger{background:#6b2940;border-color:#6b2940}button:disabled{opacity:.45}.status{margin-top:12px;padding:10px;border-radius:11px;background:#0b1324}.orb{width:128px;height:128px;margin:10px auto;border-radius:50%;background:radial-gradient(circle at 35% 30%,#425b89,#152544 52%,#0a1120);box-shadow:0 18px 45px rgba(0,0,0,.35)}.orb.speaking{animation:pulse 1.15s infinite}.call{text-align:center}.direction{font-size:18px;font-weight:800}.room{font-size:12px;color:#9daaca;margin-top:4px}.meter{height:6px;background:#0c1425;border-radius:20px;overflow:hidden;margin-top:14px}.meter i{display:block;height:100%;width:0;background:#6f8fff}.box{background:#0b1324;border-radius:12px;padding:12px;min-height:56px;margin-top:7px;line-height:1.5}.translated{font-size:18px;font-weight:650}.controls{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}.log{font:11px ui-monospace,monospace;color:#8f9dbb;max-height:130px;overflow:auto;white-space:pre-wrap}.note{font-size:11px;color:#93a2bd;line-height:1.4;margin-top:9px}.error{color:#ff9eaf}@keyframes pulse{50%{transform:scale(1.04)}}@media(max-width:600px){.row{grid-template-columns:1fr}.card{padding:14px}}
+</style></head>
+<body><main>
+<div class="card"><div class="brand"><div class="logo">S</div><div><h1 class="title">SpeakEasy</h1><div class="sub">Realtime translated call</div></div><span class="muted" style="margin-left:auto">Agora + Soniox</span></div></div>
+<div class="card">
+<div class="row"><div class="field"><label>Room code</label><input id="room" value="demo-room" autocomplete="off"></div>
+<div class="field"><label>My language</label><select id="src"><option value="en">English</option><option value="pt">Português</option><option value="es">Español</option><option value="fr">Français</option><option value="ko">한국어</option></select></div></div>
+<div class="field"><label>Translate to</label><select id="tgt"><option value="pt">Português</option><option value="en">English</option><option value="es">Español</option><option value="fr">Français</option><option value="ko">한국어</option></select></div>
+<div class="note">Both people use the same room code. Your microphone goes to Soniox; only translated audio is published to Agora.</div>
+<div class="controls"><button id="start" class="primary">Start call</button><button id="stop" class="danger" disabled>End call</button></div>
+<div class="status"><span id="status">Ready</span><span id="uid" class="muted" style="float:right"></span></div>
+</div>
+<div class="card call"><div id="orb" class="orb"></div><div id="dir" class="direction">Not connected</div><div id="roomline" class="room">Choose languages and start</div><div class="meter"><i id="meter"></i></div></div>
+<div class="card"><div class="muted">What I am saying</div><div id="original" class="box">—</div><div class="muted" style="margin-top:12px">Translated speech</div><div id="translated" class="box translated">—</div></div>
+<div class="card"><div class="muted">Session log</div><div id="log" class="log"></div></div>
+</main>
+<script>
+let AgoraRTC=null,client=null,localTrack=null,stream=null,ctx=null,micSource=null,processor=null,silent=null,outDestination=null,ws=null,running=false,playAt=0,staged=[],config=null;
+const $=id=>document.getElementById(id);
+const write=x=>{$("log").textContent+=String(x)+"\n";$("log").scrollTop=$("log").scrollHeight};
+const setStatus=(x,err=false)=>{$("status").textContent=x;$("status").className=err?"error":""};
+const roomName=v=>{const x=String(v||"").toLowerCase().replace(/[^a-z0-9_-]/g,"").slice(0,40);return x||"demo-room"};
+const channel=v=>(config.agora_channel_prefix||"speakeasy-")+roomName(v);
+function down(a,from,to){if(from===to)return a;const r=from/to,n=Math.max(1,Math.round(a.length/r)),o=new Float32Array(n);let p=0;for(let i=0;i<n;i++){const q=Math.min(a.length,Math.round((i+1)*r));let s=0,c=0;for(let j=p;j<q;j++){s+=a[j];c++}o[i]=c?s/c:0;p=q}return o}
+function pcm(a){const o=new Int16Array(a.length);for(let i=0;i<a.length;i++){const s=Math.max(-1,Math.min(1,a[i]));o[i]=s<0?s*32768:s*32767}return o}
+function clearQueue(){staged.forEach(n=>{try{n.stop()}catch(e){}});staged=[];if(ctx)playAt=ctx.currentTime+.02}
+function playTranslated(b64,rate){if(!ctx||!outDestination)return;const bytes=Uint8Array.from(atob(b64),c=>c.charCodeAt(0));const s=new Int16Array(bytes.buffer,bytes.byteOffset,Math.floor(bytes.byteLength/2));const b=ctx.createBuffer(1,s.length,rate);const ch=b.getChannelData(0);for(let i=0;i<s.length;i++)ch[i]=s[i]/32768;const n=ctx.createBufferSource();n.buffer=b;n.connect(outDestination);playAt=Math.max(playAt,ctx.currentTime+.01);n.start(playAt);playAt+=b.duration;staged.push(n);n.onended=()=>staged=staged.filter(x=>x!==n);$("orb").classList.add("speaking")}
+async function loadAgora(){if(AgoraRTC)return;await new Promise((ok,bad)=>{const s=document.createElement("script");s.src="https://download.agora.io/sdk/release/AgoraRTC_N-"+encodeURIComponent(config.agora_sdk_version)+".js";s.onload=ok;s.onerror=()=>bad(new Error("Could not load Agora Web SDK"));document.head.appendChild(s)});AgoraRTC=window.AgoraRTC}
+async function stopCall(){running=false;if(ws)try{ws.send(JSON.stringify({type:"stop"}))}catch(e){}if(ws)try{ws.close()}catch(e){}ws=null;if(processor)try{processor.disconnect()}catch(e){}if(micSource)try{micSource.disconnect()}catch(e){}if(silent)try{silent.disconnect()}catch(e){}processor=micSource=silent=null;clearQueue();if(localTrack){try{await client?.unpublish([localTrack])}catch(e){}try{localTrack.close()}catch(e){}localTrack=null}if(client){try{await client.leave()}catch(e){}client=null}if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}if(ctx){try{await ctx.close()}catch(e){}ctx=null}outDestination=null;$("start").disabled=false;$("stop").disabled=true;$("dir").textContent="Not connected";$("roomline").textContent="Choose languages and start";$("orb").classList.remove("speaking");setStatus("Ready")}
+async function startCall(){if(running)return;try{const src=$("src").value,tgt=$("tgt").value;if(src===tgt){setStatus("Choose different languages",true);return}if(!config.agora_app_id)throw new Error("AGORA_APP_ID is not configured on Render");await loadAgora();stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true}});ctx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:24000});await ctx.resume();outDestination=ctx.createMediaStreamDestination();const translatedTrack=outDestination.stream.getAudioTracks()[0];client=AgoraRTC.createClient({mode:"rtc",codec:"vp8"});client.on("user-published",async(user,type)=>{if(type!=="audio")return;try{await client.subscribe(user,"audio");user.audioTrack?.play()}catch(e){write("Remote audio error: "+(e?.message||e))}});client.on("user-unpublished",(u,type)=>{if(type==="audio")write("Remote translated audio stopped")});const uid=String(Math.floor(100000+Math.random()*900000));await client.join(config.agora_app_id,channel($("room").value),null,uid);localTrack=AgoraRTC.createCustomAudioTrack({mediaStreamTrack:translatedTrack});await client.publish([localTrack]);$("uid").textContent="UID "+uid;$("dir").textContent=src.toUpperCase()+" → "+tgt.toUpperCase();$("roomline").textContent="Room: "+roomName($("room").value);setStatus("Connected — listening");write("Agora joined "+channel($("room").value));ws=new WebSocket((location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/api/browser");ws.onopen=()=>{ws.send(JSON.stringify({type:"start",language:src,target_language:tgt}));micSource=ctx.createMediaStreamSource(stream);processor=ctx.createScriptProcessor(4096,1,1);processor.onaudioprocess=e=>{if(!running||!ws||ws.readyState!==1)return;const input=e.inputBuffer.getChannelData(0),p=pcm(down(input,ctx.sampleRate,16000));if(ws.bufferedAmount<262144)ws.send(p.buffer);let peak=0;for(const v of input)peak=Math.max(peak,Math.abs(v));$("meter").style.width=Math.min(100,peak*170)+"%"};micSource.connect(processor);silent=ctx.createGain();silent.gain.value=0;processor.connect(silent);silent.connect(ctx.destination);running=true;$("start").disabled=true;$("stop").disabled=false};ws.onmessage=e=>{const d=JSON.parse(e.data);if(d.type==="ready")setStatus("Call connected — listening");else if(d.type==="speech_start"){$("orb").classList.add("speaking");setStatus("Speaking…")}else if(d.type==="transcript"){const t=String(d.text||"").trim();if(t)$("original").textContent=t}else if(d.type==="translation_text"){const t=String(d.text||"").trim();if(t)$("translated").textContent=(($("translated").textContent==="—"?"":$("translated").textContent+" ")+t).trim()}else if(d.type==="audio")playTranslated(d.audio,d.sample_rate||24000);else if(d.type==="utterance_end"){$("orb").classList.remove("speaking");setStatus("Call connected — listening")}else if(d.type==="error"){write("ERROR ["+d.stage+"] "+d.message);setStatus("Error — see log",true)}else if(d.type==="info"){write(d.message)}};ws.onerror=()=>{write("Translation WebSocket error");setStatus("Translation connection error",true)};ws.onclose=()=>{if(running)stopCall()}}catch(e){write(e?.message||String(e));setStatus(e?.message||"Could not start call",true);await stopCall()}}
+async function boot(){try{const r=await fetch("/api/config",{cache:"no-store"});config=await r.json();if(!config.agora_app_id)write("AGORA_APP_ID is not configured. Add it to the existing speakeasy-wigvo Render service.");else write("Agora SDK "+config.agora_sdk_version+" configured")}catch(e){write("Config error: "+(e?.message||e))}}
+$("start").onclick=startCall;$("stop").onclick=stopCall;window.addEventListener("beforeunload",()=>{if(ws&&ws.readyState===1)try{ws.send(JSON.stringify({type:"stop"}))}catch(e){}});boot();
+</script></body></html>'''
+
+
 def register_browser_route(app: Any) -> None:
     app.websocket("/api/browser")(browser_translation)
 
-BROWSER_HTML_PAGE = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>SpeakEasy Browser Translation Test v0.7</title>
-<meta http-equiv="Cache-Control" content="no-store">
-<meta http-equiv="Pragma" content="no-cache">
-<meta http-equiv="Expires" content="0">
-<style>
-*{box-sizing:border-box}body{margin:0;padding:14px;background:#080d18;color:#eef2ff;font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-main{max-width:720px;margin:auto}.card{background:#151e33;border:1px solid #2d3b5d;border-radius:20px;padding:18px;margin:12px 0}
-h1{margin:0 0 5px;font-size:27px}.muted{color:#9daaca;font-size:14px}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
-label{display:block;font-size:13px;color:#aeb9d2;margin-bottom:5px}select,button{width:100%;padding:13px;border-radius:11px;border:1px solid #40527a;background:#0d1527;color:#fff;font-size:15px}
-button{font-weight:700}.primary{background:#315fe9;border-color:#315fe9}.stop{background:#6b2940;border-color:#6b2940}
-button:disabled{opacity:.45}.box{background:#0b1324;border-radius:12px;padding:13px;min-height:58px;margin-top:7px;line-height:1.5}
-#translated{font-size:20px}.meter{height:7px;background:#0c1425;border-radius:20px;overflow:hidden;margin:12px 0}.meter i{display:block;height:100%;width:0;background:#6f8fff}
-#log{font:12px ui-monospace,SFMono-Regular,Menlo,monospace;color:#8f9dbb;max-height:130px;overflow:auto;white-space:pre-wrap}
-@media(max-width:600px){.row{grid-template-columns:1fr}body{padding:8px}.card{padding:15px}}
-</style>
-</head>
-<body>
-<main>
-<div class="card"><h1>SpeakEasy</h1><div class="muted">Real-time speech-to-speech browser test — no Twilio required · v0.6</div></div>
-
-<div class="card">
-<div class="row">
-<div><label>Language A</label><select id="la"><option value="en" selected>English</option><option value="pt">Português</option><option value="es">Español</option><option value="fr">Français</option></select></div>
-<div><label>Language B</label><select id="lb"><option value="pt" selected>Português</option><option value="en">English</option><option value="es">Español</option><option value="fr">Français</option></select></div>
-</div>
-<div style="margin-top:12px"><label>Direction</label><select id="dir"><option value="a_to_b">A → B (English → Portuguese)</option><option value="b_to_a">B → A (Portuguese → English)</option></select></div>
-<div class="row" style="margin-top:12px"><button id="start" class="primary">Start microphone</button><button id="stop" class="stop" disabled>Stop</button></div>
-<div class="meter"><i id="meter"></i></div>
-<div id="status" style="font-weight:700">Ready</div>
-</div>
-
-<div class="card"><div class="muted">Original speech</div><div id="original" class="box">—</div><div class="muted" style="margin-top:13px">Translated speech (confirmed)</div><div id="translated" class="box">—</div></div>
-<div class="card"><div class="muted">Session log</div><div id="log"></div></div>
-</main>
-
-<script>
-let mediaStream=null,ctx=null,source=null,processor=null,ws=null,running=false,playAt=0,nodes=[];
-const $=x=>document.getElementById(x);
-function log(x){$("log").textContent+=x+"\\n";$("log").scrollTop=$("log").scrollHeight}
-function status(x){$("status").textContent=x}
-function downsample(a,inRate,outRate){if(inRate===outRate)return a;const ratio=inRate/outRate,len=Math.round(a.length/ratio),o=new Float32Array(len);let off=0;for(let i=0;i<len;i++){const next=Math.round((i+1)*ratio);let sum=0,n=0;for(let j=off;j<next&&j<a.length;j++){sum+=a[j];n++}o[i]=n?sum/n:0;off=next}return o}
-function pcm16(a){const o=new Int16Array(a.length);for(let i=0;i<a.length;i++){const s=Math.max(-1,Math.min(1,a[i]));o[i]=s<0?s*32768:s*32767}return o}
-function clearAudio(){nodes.forEach(n=>{try{n.stop()}catch(e){}});nodes=[];if(ctx)playAt=ctx.currentTime+.02}
-function play(b64,rate){if(!ctx)return;const raw=Uint8Array.from(atob(b64),c=>c.charCodeAt(0)),p=new Int16Array(raw.buffer),buf=ctx.createBuffer(1,p.length,rate),ch=buf.getChannelData(0);for(let i=0;i<p.length;i++)ch[i]=p[i]/32768;const n=ctx.createBufferSource();n.buffer=buf;n.connect(ctx.destination);playAt=Math.max(playAt,ctx.currentTime+.01);n.start(playAt);playAt+=buf.duration;nodes.push(n);n.onended=()=>nodes=nodes.filter(x=>x!==n)}
-async function microphone(){if(mediaStream)return;mediaStream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true}})}
-function stop(send=true){running=false;if(processor){try{processor.disconnect()}catch(e){}processor=null}if(source){try{source.disconnect()}catch(e){}source=null}clearAudio();if(ws){if(send&&ws.readyState===1)ws.send(JSON.stringify({type:"stop"}));try{ws.close()}catch(e){}ws=null}$("start").disabled=false;$("stop").disabled=true;$("meter").style.width="0";status("Stopped")}
-$("start").onclick=async()=>{try{await microphone();ctx=new(window.AudioContext||window.webkitAudioContext)();await ctx.resume();ws=new WebSocket((location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/api/browser");ws.binaryType="arraybuffer";ws.onopen=()=>{ws.send(JSON.stringify({type:"start",language_a:$("la").value,language_b:$("lb").value,direction:$("dir").value}));source=ctx.createMediaStreamSource(mediaStream);processor=ctx.createScriptProcessor(4096,1,1);processor.onaudioprocess=e=>{if(!running||!ws||ws.readyState!==1)return;const input=e.inputBuffer.getChannelData(0),samples=downsample(input,ctx.sampleRate,16000),p=pcm16(samples);ws.send(p.buffer);let peak=0;for(let i=0;i<input.length;i++)peak=Math.max(peak,Math.abs(input[i]));$("meter").style.width=Math.min(100,peak*170)+"%"};source.connect(processor);const silent=ctx.createGain();silent.gain.value=0;processor.connect(silent);silent.connect(ctx.destination);running=true;$("start").disabled=true;$("stop").disabled=false;status("Connecting…")};let lastOriginalSnapshot="", shownTranslationChunks=new Set(), shownTranslationText="";
-ws.onmessage=e=>{const d=JSON.parse(e.data);
-if(d.type==="ready"){lastOriginalSnapshot="";shownTranslationChunks.clear();shownTranslationText="";$("original").textContent="—";$("translated").textContent="—";status(d.source_language.toUpperCase()+" → "+d.target_language.toUpperCase()+" — listening")}
-else if(d.type==="speech_start"){status("Speaking…")}
-else if(d.type==="transcript"){
-  // Soniox non-final results are snapshots, not append-only deltas. Always replace.
-  const incoming=String(d.text||"").trim();
-  if(incoming){lastOriginalSnapshot=incoming;$("original").textContent=incoming}
-}
-else if(d.type==="translation_text"){
-  const id=String(d.chunk_id||d.text||"");
-  if(!shownTranslationChunks.has(id)){shownTranslationChunks.add(id);shownTranslationText=(shownTranslationText+" "+String(d.text||"")).trim();$("translated").textContent=shownTranslationText}
-}
-else if(d.type==="translation_preview"){/* provisional translation is display-only; never spoken */}
-else if(d.type==="audio"){play(d.audio,d.sample_rate||24000);status("Playing translation…")}
-else if(d.type==="utterance_end"){status("Listening…")}
-else if(d.type==="clear_audio"){log("Ignoring live clear_audio request so queued translated speech can finish.")}
-else if(d.type==="error"){log("ERROR ["+d.stage+"] "+d.message);status("Error — see log")}
-else if(d.type==="info"){log(d.message)}};ws.onerror=()=>{status("Connection error");log("WebSocket connection error")};ws.onclose=()=>{if(running)stop(false)}}catch(e){status("Microphone error");log(e.message)}}
-$("stop").onclick=()=>stop(true);
-window.addEventListener("beforeunload",()=>stop(true));
-</script>
-</body>
-</html>"""
 
 def register_browser_home(app: Any) -> None:
-    from fastapi.responses import HTMLResponse
+    from fastapi.responses import HTMLResponse, JSONResponse
+
+    headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
+
+    @app.get("/", response_class=HTMLResponse)
+    async def browser_root() -> HTMLResponse:
+        return HTMLResponse(BROWSER_HTML_PAGE, headers=headers)
+
     @app.get("/browser", response_class=HTMLResponse)
     async def browser_home() -> HTMLResponse:
-        return HTMLResponse(
-            BROWSER_HTML_PAGE,
-            headers={
-                "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-                "Pragma": "no-cache",
-                "Expires": "0",
-            },
-        )
+        return HTMLResponse(BROWSER_HTML_PAGE, headers=headers)
+
+    @app.get("/api/config", response_class=JSONResponse)
+    async def browser_config() -> JSONResponse:
+        return JSONResponse({
+            "transport": "agora_soniox",
+            "agora_app_id": AGORA_APP_ID,
+            "agora_sdk_version": AGORA_SDK_VERSION,
+            "agora_channel_prefix": AGORA_CHANNEL_PREFIX,
+            "soniox_configured": bool(SONIOX_API_KEY),
+        }, headers=headers)
