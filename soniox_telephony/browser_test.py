@@ -758,15 +758,26 @@ async function startCall(){
     await loadAgora();
     c=AgoraRTC.createClient({mode:"rtc",codec:"vp8"});
     client=c;
-    c.on("user-published",async(user,type)=>{
-      if(type!=="audio"||!running)return;
+    const subscribeRemoteAudio=async(user)=>{
+      if(!user||c!==client||c.connectionState!=="CONNECTED")return;
+      if(!user.hasAudio)return;
       try{
         await c.subscribe(user,"audio");
-        user.audioTrack?.play();
-        write("Remote live voice connected");
-      }catch(e){if(running)write("Remote audio error: "+(e?.message||e));}
+        if(user.audioTrack){
+          user.audioTrack.play();
+          write("Remote live voice connected (UID "+user.uid+")");
+        }
+      }catch(e){
+        if(c===client)write("Remote audio error: "+(e?.message||e));
+      }
+    };
+    c.on("user-published",async(user,type)=>{
+      if(type!=="audio")return;
+      await subscribeRemoteAudio(user);
     });
-    c.on("user-unpublished",(u,type)=>{if(type==="audio"&&running)write("Remote live voice stopped");});
+    c.on("user-unpublished",(u,type)=>{
+      if(type==="audio"&&c===client)write("Remote live voice stopped (UID "+u.uid+")");
+    });
 
     const uid=Math.floor(100000+Math.random()*900000);
     const channelName=channel($("room").value);
@@ -781,6 +792,15 @@ async function startCall(){
     localTrack=await AgoraRTC.createMicrophoneAudioTrack({encoderConfig:"speech_low_quality",AEC:true,ANS:true,AGC:true});
     if(!starting)throw new Error("Call was stopped while creating microphone");
     await c.publish([localTrack]);
+
+    // A remote user may have published before this client finished joining
+    // or while this client was still creating/publishing its microphone.
+    // In that case the user-published callback can arrive before running=true.
+    // Scan the SDK's current remote-user list after our own publish so that
+    // an already-published microphone is never missed.
+    for(const user of (c.remoteUsers||[])){
+      await subscribeRemoteAudio(user);
+    }
 
     running=true;
     starting=false;
