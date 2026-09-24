@@ -64,6 +64,8 @@ async def tts_worker(tts_ws: Any, state: dict[str, Any]) -> None:
             if info["utterance_id"] == utterance_id:
                 done = info["done"]
                 if not done.is_set():
+                    timing = state["timings"].get(utterance_id, {})
+                    info["speech_started_at"] = timing.get("speech_started_at")
                     return sid
                 state["tts_streams"].pop(sid, None)
                 state["tts_done"].pop(sid, None)
@@ -251,6 +253,28 @@ async def browser_translation(ws: WebSocket) -> None:
         speech_started = False
         last_original_text = ""
 
+        # Pre-configure the first TTS stream while the caller is getting ready.
+        # The stream may expire if the caller waits too long; ensure_stream()
+        # will simply create a fresh stream in that case.
+        state["seq"] += 1
+        prewarm_sid = f"browser-{state['seq']}-prewarm"
+        prewarm_done = asyncio.Event()
+        state["tts_streams"][prewarm_sid] = {
+            "done": prewarm_done,
+            "utterance_id": 1,
+            "speech_started_at": None,
+        }
+        state["tts_done"][prewarm_sid] = prewarm_done
+        await tts_ws.send(json.dumps({
+            "api_key": SONIOX_API_KEY,
+            "model": SONIOX_TTS_MODEL,
+            "language": target,
+            "voice": voice,
+            "audio_format": "pcm_s16le",
+            "sample_rate": 24000,
+            "stream_id": prewarm_sid,
+        }))
+
         await ws.send_json({
             "type": "ready",
             "source_language": source,
@@ -410,17 +434,25 @@ async def browser_translation(ws: WebSocket) -> None:
                                 preview_original.append(token_text)
 
                             if state.get("tts_only"):
-                                tts_candidate = final_original + "".join(preview_original)
+                                # Only stream finalized STT text into TTS.
+                                # Partial hypotheses can revise earlier words,
+                                # so using them here can either delay TTS or
+                                # cause repeated/stale speech. Finalized words
+                                # are stable and can be released immediately.
+                                tts_candidate = final_original
                                 sent = int(state.get("tts_only_sent", 0))
                                 if len(tts_candidate) > sent:
                                     delta = tts_candidate[sent:]
+                                    leading = len(delta) - len(delta.lstrip())
+                                    clean_delta = delta.lstrip()
                                     boundary = -1
-                                    for i, ch in enumerate(delta):
-                                        if ch in " ,.!?:;":
+                                    for i, ch in enumerate(clean_delta):
+                                        if i > 0 and ch in " ,.!?:;":
                                             boundary = i
                                             break
-                                    if boundary >= 0:
-                                        chunk = delta[:boundary + 1].strip()
+                                    if boundary >= 1:
+                                        chunk = clean_delta[:boundary].strip()
+                                        cut = leading + boundary
                                         if len(chunk) >= 2:
                                             try:
                                                 state["tts_queue"].put_nowait({
@@ -428,7 +460,7 @@ async def browser_translation(ws: WebSocket) -> None:
                                                     "end": False,
                                                     "utterance_id": state["utterance_id"],
                                                 })
-                                                state["tts_only_sent"] = sent + boundary + 1
+                                                state["tts_only_sent"] = sent + cut
                                                 state["translation_seq"] += 1
                                                 await ws.send_json({
                                                     "type": "tts_text",
@@ -885,7 +917,7 @@ async function startCall(){
     ws.onmessage=async(ev)=>{
       try{
         const data=JSON.parse(ev.data);
-        if(data.type==="ready"){write("Soniox TTS-only pipeline ready");return}
+        if(data.type==="ready"){write("Soniox TTS-only pipeline ready");write("TTS [prewarm] first stream configured");return}
         if(data.type==="error"){write("["+data.stage+"] "+data.message);return}
         if(data.type==="raw_stt"){
           const label=data.final_text||data.partial_text||data.text||"";
@@ -918,15 +950,15 @@ async function startCall(){
     };
     ws.send(JSON.stringify({mode:"tts_only",language:"en",target_language:"en",voice:"Adrian"}));
 
-    playCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:24000});
+    playCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:24000,latencyHint:"interactive"});
     await playCtx.resume();
     outDestination=playCtx.createMediaStreamDestination();
 
-    micCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000});
+    micCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000,latencyHint:"interactive"});
     await micCtx.resume();
     const sourceNode=micCtx.createMediaStreamSource(stream);
     const gain=micCtx.createGain();
-    processor=micCtx.createScriptProcessor(4096,1,1);
+    processor=micCtx.createScriptProcessor(1024,1,1);
     silent=micCtx.createGain();
     silent.gain.value=0;
     sourceNode.connect(gain);
