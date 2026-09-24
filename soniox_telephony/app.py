@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 from twilio.rest import Client
 from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import VoiceResponse
+from agora_token import build_rtc_token_with_uid
 from browser_test import register_browser_route, register_browser_home
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -39,6 +40,10 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 TWILIO_VALIDATE_SIGNATURE = os.getenv("TWILIO_VALIDATE_SIGNATURE", "false").lower() == "true"
+AGORA_APP_ID = os.getenv("AGORA_APP_ID", "").strip()
+AGORA_APP_CERTIFICATE = os.getenv("AGORA_APP_CERTIFICATE", "").strip()
+AGORA_TOKEN_TTL_S = max(60, min(int(os.getenv("AGORA_TOKEN_TTL_S", "3600")), 86400))
+AGORA_CHANNEL_PREFIX = os.getenv("AGORA_CHANNEL_PREFIX", "speakeasy-").strip() or "speakeasy-"
 MAX_CALL_DURATION_S = max(60, int(os.getenv("MAX_CALL_DURATION_S", "1800")))
 
 app = FastAPI(title="SpeakEasy WIGVO — Soniox Telephony Core", version="0.1.0")
@@ -403,6 +408,34 @@ async def initiate_twilio_call(phone: str, session_id: str, leg: str) -> str:
         timeout=30,
     )
     return str(call.sid)
+
+
+@app.get("/api/agora-token")
+async def agora_token(channel: str, uid: int) -> JSONResponse:
+    channel = channel.strip()
+    if not AGORA_APP_ID or not AGORA_APP_CERTIFICATE:
+        raise HTTPException(status_code=503, detail="Agora token authentication is not configured on Render.")
+    if not channel.startswith(AGORA_CHANNEL_PREFIX):
+        raise HTTPException(status_code=400, detail="Invalid Agora channel.")
+    if not (1 <= uid <= 0xFFFFFFFF):
+        raise HTTPException(status_code=400, detail="Invalid Agora UID.")
+    try:
+        token = build_rtc_token_with_uid(
+            AGORA_APP_ID,
+            AGORA_APP_CERTIFICATE,
+            channel,
+            uid,
+            token_expire_seconds=AGORA_TOKEN_TTL_S,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return JSONResponse({
+        "token": token,
+        "app_id": AGORA_APP_ID,
+        "channel": channel,
+        "uid": uid,
+        "expires_in": AGORA_TOKEN_TTL_S,
+    })
 
 
 @app.get("/health")
