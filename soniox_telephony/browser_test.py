@@ -387,6 +387,9 @@ async def browser_translation(ws: WebSocket) -> None:
                                         "type": "pipeline_timing",
                                         "stage": "translation_token",
                                         "elapsed_ms": elapsed_ms,
+                                        "translation_token_text": token_text,
+                                        "translation_token_final": is_final,
+                                        "translation_token_status": status,
                                     })
                                 except Exception:
                                     pass
