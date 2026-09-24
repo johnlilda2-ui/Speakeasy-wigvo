@@ -691,18 +691,18 @@ main{width:min(720px,100%);margin:auto}.card{background:rgba(16,25,45,.9);border
 .brand{display:flex;align-items:center;gap:10px}.logo{width:44px;height:44px;border-radius:13px;background:#eef2ff;color:#0b1324;display:grid;place-items:center;font-weight:900}.title{margin:0;font-size:23px}.muted{color:#9daaca;font-size:13px}.sub{color:#b9c4dc;font-size:13px}.row{display:grid;grid-template-columns:1fr 1fr;gap:10px}.field{margin-top:10px}.field label{display:block;font-size:12px;color:#aeb9d2;margin-bottom:5px}.field input,.field select,button{width:100%;padding:12px;border-radius:11px;border:1px solid #40527a;background:#0d1527;color:#fff;font-size:15px}button{font-weight:750}.primary{background:#315fe9;border-color:#315fe9}.danger{background:#6b2940;border-color:#6b2940}button:disabled{opacity:.45}.status{margin-top:12px;padding:10px;border-radius:11px;background:#0b1324}.orb{width:128px;height:128px;margin:10px auto;border-radius:50%;background:radial-gradient(circle at 35% 30%,#425b89,#152544 52%,#0a1120);box-shadow:0 18px 45px rgba(0,0,0,.35)}.orb.speaking{animation:pulse 1.15s infinite}.call{text-align:center}.direction{font-size:18px;font-weight:800}.room{font-size:12px;color:#9daaca;margin-top:4px}.meter{height:6px;background:#0c1425;border-radius:20px;overflow:hidden;margin-top:14px}.meter i{display:block;height:100%;width:0;background:#6f8fff}.box{background:#0b1324;border-radius:12px;padding:12px;min-height:56px;margin-top:7px;line-height:1.5}.translated{font-size:18px;font-weight:650}.controls{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px}.log{font:11px ui-monospace,monospace;color:#8f9dbb;max-height:130px;overflow:auto;white-space:pre-wrap}.note{font-size:11px;color:#93a2bd;line-height:1.4;margin-top:9px}.error{color:#ff9eaf}@keyframes pulse{50%{transform:scale(1.04)}}@media(max-width:600px){.row{grid-template-columns:1fr}.card{padding:14px}}
 </style></head>
 <body><main>
-<div class="card"><div class="brand"><div class="logo">S</div><div><h1 class="title">SpeakEasy</h1><div class="sub">Realtime translated call</div></div><span class="muted" style="margin-left:auto">Agora + Soniox</span></div></div>
+<div class="card"><div class="brand"><div class="logo">S</div><div><h1 class="title">SpeakEasy</h1><div class="sub">Live voice call — no translation</div></div><span class="muted" style="margin-left:auto">Agora voice</span></div></div>
 <div class="card">
 <div class="row"><div class="field"><label>Room code</label><input id="room" value="demo-room" autocomplete="off"></div>
-<div class="field"><label>My language</label><select id="src"><option value="en">English</option><option value="pt">Português</option><option value="es">Español</option><option value="fr">Français</option><option value="ko">한국어</option></select></div></div>
-<div class="field"><label>Translate to</label><select id="tgt"><option value="pt">Português</option><option value="en">English</option><option value="es">Español</option><option value="fr">Français</option><option value="ko">한국어</option></select></div>
-<div class="note">Both people use the same room code. Your microphone goes to Soniox; only translated audio is published to Agora.</div>
+<div class="field"><label>Language</label><select id="src"><option value="en">English</option></select></div></div>
+<div class="field"><label>Call audio</label><select id="tgt"><option value="en">English voice</option></select></div>
+<div class="note">Both people use the same room code. Your microphone is sent directly to Agora. No Soniox translation and no TTS are used in this test.</div>
 <audio id="playback" autoplay playsinline style="display:none"></audio><div class="controls"><button id="start" class="primary">Start call</button><button id="stop" class="danger" disabled>End call</button></div>
 <div class="status"><span id="status">Ready</span><span id="uid" class="muted" style="float:right"></span></div>
 </div>
 <div class="card call"><div id="orb" class="orb"></div><div id="dir" class="direction">Not connected</div><div id="roomline" class="room">Choose languages and start</div><div class="meter"><i id="meter"></i></div></div>
-<div class="card"><div class="muted">What I am saying</div><div id="original" class="box">—</div><div class="muted" style="margin-top:12px">Translated speech</div><div id="translated" class="box translated">—</div></div>
-<div class="card"><div class="muted">Raw Soniox STT diagnostic</div><div id="rawStt" class="box">—</div><div id="sttMeta" class="note">Waiting for microphone audio…</div></div>
+<div class="card"><div class="muted">Live voice</div><div id="original" class="box">Your real microphone audio is sent directly through Agora.</div><div class="muted" style="margin-top:12px">Audio path</div><div id="translated" class="box translated">Microphone → Agora → remote speaker</div></div>
+<div class="card"><div class="muted">Voice test</div><div id="rawStt" class="box">STT, translation and TTS are bypassed.</div><div id="sttMeta" class="note">Testing only the live Agora voice path.</div></div>
 <div class="card"><div class="muted">Session log</div><div id="log" class="log"></div></div>
 </main>
 <script>
@@ -719,7 +719,69 @@ function clearQueue(){staged.forEach(n=>{try{n.stop()}catch(e){}});staged=[];if(
 function playTranslated(b64,rate){if(!playCtx||!outDestination)return;const bytes=Uint8Array.from(atob(b64),c=>c.charCodeAt(0));const s=new Int16Array(bytes.buffer,bytes.byteOffset,Math.floor(bytes.byteLength/2));const b=playCtx.createBuffer(1,s.length,rate);const ch=b.getChannelData(0);for(let i=0;i<s.length;i++)ch[i]=s[i]/32768;const n=playCtx.createBufferSource();n.buffer=b;n.connect(outDestination);playAt=Math.max(playAt,playCtx.currentTime+.01);n.start(playAt);playAt+=b.duration;staged.push(n);n.onended=()=>staged=staged.filter(x=>x!==n);$("orb").classList.add("speaking")}
 async function loadAgora(){if(AgoraRTC)return;await new Promise((ok,bad)=>{const s=document.createElement("script");s.src="https://download.agora.io/sdk/release/AgoraRTC_N-"+encodeURIComponent(config.agora_sdk_version)+".js";s.onload=ok;s.onerror=()=>bad(new Error("Could not load Agora Web SDK"));document.head.appendChild(s)});AgoraRTC=window.AgoraRTC}
 async function stopCall(){running=false;if(ws)try{ws.send(JSON.stringify({type:"stop"}))}catch(e){}if(ws)try{ws.close()}catch(e){}ws=null;if(playbackEl){try{playbackEl.pause()}catch(e){}playbackEl.srcObject=null;playbackEl=null}if(processor)try{processor.disconnect()}catch(e){}if(micSource)try{micSource.disconnect()}catch(e){}if(silent)try{silent.disconnect()}catch(e){}processor=micSource=silent=null;clearQueue();if(localTrack){try{await client?.unpublish([localTrack])}catch(e){}try{localTrack.close()}catch(e){}localTrack=null}if(client){try{await client.leave()}catch(e){}client=null}if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}if(micCtx){try{await micCtx.close()}catch(e){}micCtx=null}if(playCtx){try{await playCtx.close()}catch(e){}playCtx=null}monitorGain=null;outDestination=null;$("start").disabled=false;$("stop").disabled=true;$("dir").textContent="Not connected";$("roomline").textContent="Choose languages and start";$("orb").classList.remove("speaking");setStatus("Ready")}
-async function startCall(){if(running)return;try{const src=$("src").value,tgt=$("tgt").value;if(src===tgt){setStatus("Choose different languages",true);return}if(!config.agora_app_id)throw new Error("AGORA_APP_ID is not configured on Render");await loadAgora();stream=await navigator.mediaDevices.getUserMedia({audio:{channelCount:1,echoCancellation:true,noiseSuppression:true,autoGainControl:true}});playCtx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:24000});await playCtx.resume();outDestination=playCtx.createMediaStreamDestination();playbackEl=$("playback");playbackEl.srcObject=outDestination.stream;playbackEl.autoplay=true;playbackEl.playsInline=true;playbackEl.volume=1;try{await playbackEl.play()}catch(e){write("Playback start: "+(e?.message||e))}const translatedTrack=outDestination.stream.getAudioTracks()[0];micCtx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:16000});await micCtx.resume();if(!micCtx.audioWorklet)throw new Error("AudioWorklet is not supported by this browser");const workletCode=`class SpeakEasyPCM extends AudioWorkletProcessor{constructor(){super();this.buf=[];this.need=0;this.inputRate=sampleRate;this.outRate=16000;this.outFrames=320}process(inputs,outputs){const input=inputs[0]?.[0],output=outputs[0]?.[0];if(output)output.fill(0);if(!input)return true;for(let i=0;i<input.length;i++)this.buf.push(input[i]);const inNeeded=Math.round(this.outFrames*this.inputRate/this.outRate);while(this.buf.length>=inNeeded){const pcm=new Int16Array(this.outFrames);let peak=0;for(let i=0;i<this.outFrames;i++){const pos=i*(inNeeded-1)/(this.outFrames-1);const a=this.buf[Math.floor(pos)]||0;const b=this.buf[Math.min(inNeeded-1,Math.floor(pos)+1)]||a;const s=a+(b-a)*(pos-Math.floor(pos));const v=Math.max(-1,Math.min(1,s));peak=Math.max(peak,Math.abs(v));pcm[i]=v<0?v*32768:v*32767}this.buf.splice(0,inNeeded);this.port.postMessage({pcm:pcm.buffer,peak,inputRate:this.inputRate},{transfer:[pcm.buffer]})}return true}}registerProcessor("speakeasy-pcm",SpeakEasyPCM);`;const blob=new Blob([workletCode],{type:"application/javascript"});const workletUrl=URL.createObjectURL(blob);try{await micCtx.audioWorklet.addModule(workletUrl)}finally{URL.revokeObjectURL(workletUrl)};client=AgoraRTC.createClient({mode:"rtc",codec:"vp8"});client.on("user-published",async(user,type)=>{if(type!=="audio")return;try{await client.subscribe(user,"audio");user.audioTrack?.play()}catch(e){write("Remote audio error: "+(e?.message||e))}});client.on("user-unpublished",(u,type)=>{if(type==="audio")write("Remote translated audio stopped")});const uid=Math.floor(100000+Math.random()*900000);const channelName=channel($("room").value);const tokenResponse=await fetch("/api/agora-token?channel="+encodeURIComponent(channelName)+"&uid="+uid,{cache:"no-store"});let tokenJson={};try{tokenJson=await tokenResponse.json()}catch(e){}if(!tokenResponse.ok||!tokenJson.token)throw new Error(tokenJson.detail||"Could not obtain Agora RTC token");await client.join(config.agora_app_id,channelName,tokenJson.token,uid);localTrack=AgoraRTC.createCustomAudioTrack({mediaStreamTrack:translatedTrack});await client.publish([localTrack]);$("uid").textContent="UID "+uid;$("dir").textContent=src.toUpperCase()+" → "+tgt.toUpperCase();$("roomline").textContent="Room: "+roomName($("room").value);setStatus("Connected — listening");write("Agora joined "+channelName+" with a short-lived RTC token");ws=new WebSocket((location.protocol==="https:"?"wss":"ws")+"://"+location.host+"/api/browser");ws.onopen=()=>{ws.send(JSON.stringify({type:"start",language:src,target_language:tgt}));micPackets=0;micBytes=0;speechAt=firstSttAt=translationAt=audioAt=0;lastRawSttText="";timingTranslationShown=false;timingAudioShown=false;pipelineTiming={};diagnosticSourceLanguage="";diagnosticTokenCount=0;micSource=micCtx.createMediaStreamSource(stream);processor=new AudioWorkletNode(micCtx,"speakeasy-pcm",{numberOfInputs:1,numberOfOutputs:1,outputChannelCount:[1]});processor.port.onmessage=e=>{if(!running||!ws||ws.readyState!==1)return;const p=e.data?.pcm;if(p){micPackets++;micBytes+=p.byteLength||0;if(ws.bufferedAmount<262144)ws.send(p);$("meter").style.width=Math.min(100,(Number(e.data?.peak)||0)*170)+"%"}};micSource.connect(processor);silent=micCtx.createGain();silent.gain.value=0;processor.connect(silent);silent.connect(micCtx.destination);running=true;$("start").disabled=true;$("stop").disabled=false};ws.onmessage=e=>{const d=JSON.parse(e.data);if(d.type==="ready")setStatus("Call connected — listening");else if(d.type==="speech_start"){currentUtteranceId=Number(d.utterance_id)||0;speechAt=performance.now();firstSttAt=0;translationAt=0;audioAt=0;lastRawSttText="";pipelineTiming={};diagnosticSourceLanguage="";diagnosticTokenCount=0;timingTranslationShown=false;timingAudioShown=false;$("rawStt").textContent="—";renderTiming();$("orb").classList.add("speaking");setStatus("Speaking…")}else if(d.type==="raw_stt"){const t=String(d.text||"").trim();if(t){lastRawSttText=t;$("rawStt").textContent=t;if(!firstSttAt)firstSttAt=performance.now();}if(d.source_language)diagnosticSourceLanguage=String(d.source_language);if(d.token_count!=null&&Number(d.token_count)>0)diagnosticTokenCount=Number(d.token_count);renderTiming()}else if(d.type==="pipeline_timing"){if(d.utterance_id!=null&&currentUtteranceId&&Number(d.utterance_id)!==currentUtteranceId)return;pipelineTiming[d.stage]=d.elapsed_ms;if(d.stage==="translation_token"){pipelineTiming.translation_token_final=d.translation_token_final;pipelineTiming.translation_token_text=d.translation_token_text;pipelineTiming.translation_token_status=d.translation_token_status}renderTiming()}else if(d.type==="transcript"){const t=String(d.text||"").trim();if(t)$("original").textContent=t}else if(d.type==="translation_text"){if(!translationAt)translationAt=performance.now();const t=String(d.text||"").trim();if(t)$("translated").textContent=(($("translated").textContent==="—"?"":$("translated").textContent+" ")+t).trim();if(speechAt&&!timingTranslationShown)timingTranslationShown=true;renderTiming()}else if(d.type==="audio"){if(!audioAt)audioAt=performance.now();playTranslated(d.audio,d.sample_rate||24000);if(speechAt&&!timingAudioShown)timingAudioShown=true;renderTiming()}else if(d.type==="utterance_end"){if(d.utterance_id==null||Number(d.utterance_id)===currentUtteranceId){$("orb").classList.remove("speaking");setStatus("Call connected — listening")}}else if(d.type==="error"){write("ERROR ["+d.stage+"] "+d.message);setStatus("Error — see log",true)}else if(d.type==="info"){write(d.message)}};ws.onerror=()=>{write("Translation WebSocket error");setStatus("Translation connection error",true)};ws.onclose=()=>{if(running)stopCall()}}catch(e){write(e?.message||String(e));setStatus(e?.message||"Could not start call",true);await stopCall()}}
+async function startCall(){
+  if(running)return;
+  try{
+    await loadAgora();
+
+    client=AgoraRTC.createClient({mode:"rtc",codec:"vp8"});
+    client.on("user-published",async(user,type)=>{
+      if(type!=="audio")return;
+      try{
+        await client.subscribe(user,"audio");
+        user.audioTrack?.play();
+        write("Remote live voice connected");
+      }catch(e){
+        write("Remote audio error: "+(e?.message||e));
+      }
+    });
+    client.on("user-unpublished",(u,type)=>{
+      if(type==="audio")write("Remote live voice stopped");
+    });
+
+    const uid=Math.floor(100000+Math.random()*900000);
+    const channelName=channel($("room").value);
+    const tokenResponse=await fetch(
+      "/api/agora-token?channel="+encodeURIComponent(channelName)+"&uid="+uid,
+      {cache:"no-store"}
+    );
+    let tokenJson={};
+    try{tokenJson=await tokenResponse.json()}catch(e){}
+    if(!tokenResponse.ok||!tokenJson.token){
+      throw new Error(tokenJson.detail||"Could not obtain Agora RTC token");
+    }
+
+    await client.join(config.agora_app_id,channelName,tokenJson.token,uid);
+
+    localTrack=await AgoraRTC.createMicrophoneAudioTrack({
+      encoderConfig:"speech_low_quality",
+      AEC:true,
+      ANS:true,
+      AGC:true
+    });
+    await client.publish([localTrack]);
+
+    running=true;
+    $("uid").textContent="UID "+uid;
+    $("dir").textContent="ENGLISH ↔ ENGLISH";
+    $("roomline").textContent="Room: "+roomName($("room").value);
+    $("orb").classList.add("speaking");
+    $("meter").style.width="0%";
+    setStatus("Live voice connected");
+    write("Agora joined "+channelName+" — microphone audio only");
+    write("Translation and TTS are disabled for this test");
+
+    setTimeout(()=>{
+      if(running)$("orb").classList.remove("speaking");
+    },700);
+    $("start").disabled=true;
+    $("stop").disabled=false;
+  }catch(e){
+    write(e?.message||String(e));
+    setStatus(e?.message||"Could not start call",true);
+    await stopCall();
+  }
+}
 async function boot(){try{const r=await fetch("/api/config",{cache:"no-store"});config=await r.json();if(!config.agora_app_id)write("AGORA_APP_ID is not configured. Add it to the existing speakeasy-wigvo Render service.");else write("Agora SDK "+config.agora_sdk_version+" configured")}catch(e){write("Config error: "+(e?.message||e))}}
 $("start").onclick=startCall;$("stop").onclick=stopCall;window.addEventListener("beforeunload",()=>{if(ws&&ws.readyState===1)try{ws.send(JSON.stringify({type:"stop"}))}catch(e){}});boot();
 </script></body></html>'''
