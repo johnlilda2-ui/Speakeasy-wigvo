@@ -706,7 +706,7 @@ main{width:min(720px,100%);margin:auto}.card{background:rgba(16,25,45,.9);border
 <div class="card"><div class="muted">Session log</div><div id="log" class="log"></div></div>
 </main>
 <script>
-let AgoraRTC=null,client=null,localTrack=null,stream=null,playCtx=null,micCtx=null,micSource=null,processor=null,silent=null,monitorGain=null,outDestination=null,playbackEl=null,ws=null,running=false,playAt=0,staged=[],config=null,micPackets=0,micBytes=0,speechAt=0,firstSttAt=0,translationAt=0,audioAt=0,lastRawSttText="",timingTranslationShown=false,timingAudioShown=false,pipelineTiming={},diagnosticSourceLanguage="",diagnosticTokenCount=0,currentUtteranceId=0;
+let AgoraRTC=null,client=null,localTrack=null,stream=null,playCtx=null,micCtx=null,micSource=null,processor=null,silent=null,monitorGain=null,outDestination=null,playbackEl=null,ws=null,running=false,starting=false,playAt=0,staged=[],config=null,micPackets=0,micBytes=0,speechAt=0,firstSttAt=0,translationAt=0,audioAt=0,lastRawSttText="",timingTranslationShown=false,timingAudioShown=false,pipelineTiming={},diagnosticSourceLanguage="",diagnosticTokenCount=0,currentUtteranceId=0;
 const $=id=>document.getElementById(id);
 const write=x=>{$("log").textContent+=String(x)+"\n";$("log").scrollTop=$("log").scrollHeight};
 const setStatus=(x,err=false)=>{$("status").textContent=x;$("status").className=err?"error":""};
@@ -718,68 +718,93 @@ function pcm(a){const o=new Int16Array(a.length);for(let i=0;i<a.length;i++){con
 function clearQueue(){staged.forEach(n=>{try{n.stop()}catch(e){}});staged=[];if(playCtx)playAt=playCtx.currentTime+.02}
 function playTranslated(b64,rate){if(!playCtx||!outDestination)return;const bytes=Uint8Array.from(atob(b64),c=>c.charCodeAt(0));const s=new Int16Array(bytes.buffer,bytes.byteOffset,Math.floor(bytes.byteLength/2));const b=playCtx.createBuffer(1,s.length,rate);const ch=b.getChannelData(0);for(let i=0;i<s.length;i++)ch[i]=s[i]/32768;const n=playCtx.createBufferSource();n.buffer=b;n.connect(outDestination);playAt=Math.max(playAt,playCtx.currentTime+.01);n.start(playAt);playAt+=b.duration;staged.push(n);n.onended=()=>staged=staged.filter(x=>x!==n);$("orb").classList.add("speaking")}
 async function loadAgora(){if(AgoraRTC)return;await new Promise((ok,bad)=>{const s=document.createElement("script");s.src="https://download.agora.io/sdk/release/AgoraRTC_N-"+encodeURIComponent(config.agora_sdk_version)+".js";s.onload=ok;s.onerror=()=>bad(new Error("Could not load Agora Web SDK"));document.head.appendChild(s)});AgoraRTC=window.AgoraRTC}
-async function stopCall(){running=false;if(ws)try{ws.send(JSON.stringify({type:"stop"}))}catch(e){}if(ws)try{ws.close()}catch(e){}ws=null;if(playbackEl){try{playbackEl.pause()}catch(e){}playbackEl.srcObject=null;playbackEl=null}if(processor)try{processor.disconnect()}catch(e){}if(micSource)try{micSource.disconnect()}catch(e){}if(silent)try{silent.disconnect()}catch(e){}processor=micSource=silent=null;clearQueue();if(localTrack){try{await client?.unpublish([localTrack])}catch(e){}try{localTrack.close()}catch(e){}localTrack=null}if(client){try{await client.leave()}catch(e){}client=null}if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}if(micCtx){try{await micCtx.close()}catch(e){}micCtx=null}if(playCtx){try{await playCtx.close()}catch(e){}playCtx=null}monitorGain=null;outDestination=null;$("start").disabled=false;$("stop").disabled=true;$("dir").textContent="Not connected";$("roomline").textContent="Choose languages and start";$("orb").classList.remove("speaking");setStatus("Ready")}
+async function stopCall(){
+  running=false;
+  starting=false;
+  if(ws)try{ws.send(JSON.stringify({type:"stop"}))}catch(e){}
+  if(ws)try{ws.close()}catch(e){}
+  ws=null;
+  if(playbackEl){try{playbackEl.pause()}catch(e){}playbackEl.srcObject=null;playbackEl=null}
+  if(processor)try{processor.disconnect()}catch(e){}
+  if(micSource)try{micSource.disconnect()}catch(e){}
+  if(silent)try{silent.disconnect()}catch(e){}
+  processor=micSource=silent=null;
+  clearQueue();
+  const c=client;
+  client=null;
+  if(localTrack){
+    try{if(c&&c.connectionState==="CONNECTED")await c.unpublish([localTrack])}catch(e){}
+    try{localTrack.close()}catch(e){}
+    localTrack=null;
+  }
+  if(c){
+    try{if(c.connectionState!=="DISCONNECTED")await c.leave()}catch(e){}
+  }
+  if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}
+  if(micCtx){try{await micCtx.close()}catch(e){}micCtx=null}
+  if(playCtx){try{await playCtx.close()}catch(e){}playCtx=null}
+  monitorGain=null;outDestination=null;
+  $("start").disabled=false;$("stop").disabled=true;
+  $("dir").textContent="Not connected";$("roomline").textContent="Choose languages and start";
+  $("orb").classList.remove("speaking");setStatus("Ready")
+}
 async function startCall(){
-  if(running)return;
+  if(running||starting)return;
+  starting=true;
+  $("start").disabled=true;
+  setStatus("Connecting...");
+  let c=null;
   try{
     await loadAgora();
-
-    client=AgoraRTC.createClient({mode:"rtc",codec:"vp8"});
-    client.on("user-published",async(user,type)=>{
-      if(type!=="audio")return;
+    c=AgoraRTC.createClient({mode:"rtc",codec:"vp8"});
+    client=c;
+    c.on("user-published",async(user,type)=>{
+      if(type!=="audio"||!running)return;
       try{
-        await client.subscribe(user,"audio");
+        await c.subscribe(user,"audio");
         user.audioTrack?.play();
         write("Remote live voice connected");
-      }catch(e){
-        write("Remote audio error: "+(e?.message||e));
-      }
+      }catch(e){if(running)write("Remote audio error: "+(e?.message||e));}
     });
-    client.on("user-unpublished",(u,type)=>{
-      if(type==="audio")write("Remote live voice stopped");
-    });
+    c.on("user-unpublished",(u,type)=>{if(type==="audio"&&running)write("Remote live voice stopped");});
 
     const uid=Math.floor(100000+Math.random()*900000);
     const channelName=channel($("room").value);
-    const tokenResponse=await fetch(
-      "/api/agora-token?channel="+encodeURIComponent(channelName)+"&uid="+uid,
-      {cache:"no-store"}
-    );
+    const tokenResponse=await fetch("/api/agora-token?channel="+encodeURIComponent(channelName)+"&uid="+uid,{cache:"no-store"});
     let tokenJson={};
     try{tokenJson=await tokenResponse.json()}catch(e){}
-    if(!tokenResponse.ok||!tokenJson.token){
-      throw new Error(tokenJson.detail||"Could not obtain Agora RTC token");
-    }
+    if(!tokenResponse.ok||!tokenJson.token)throw new Error(tokenJson.detail||"Could not obtain Agora RTC token");
 
-    await client.join(config.agora_app_id,channelName,tokenJson.token,uid);
+    await c.join(config.agora_app_id,channelName,tokenJson.token,uid);
+    if(!starting)throw new Error("Call was stopped while connecting");
 
-    localTrack=await AgoraRTC.createMicrophoneAudioTrack({
-      encoderConfig:"speech_low_quality",
-      AEC:true,
-      ANS:true,
-      AGC:true
-    });
-    await client.publish([localTrack]);
+    localTrack=await AgoraRTC.createMicrophoneAudioTrack({encoderConfig:"speech_low_quality",AEC:true,ANS:true,AGC:true});
+    if(!starting)throw new Error("Call was stopped while creating microphone");
+    await c.publish([localTrack]);
 
     running=true;
+    starting=false;
     $("uid").textContent="UID "+uid;
     $("dir").textContent="ENGLISH ↔ ENGLISH";
     $("roomline").textContent="Room: "+roomName($("room").value);
-    $("orb").classList.add("speaking");
-    $("meter").style.width="0%";
+    $("orb").classList.add("speaking");$("meter").style.width="0%";
     setStatus("Live voice connected");
     write("Agora joined "+channelName+" — microphone audio only");
     write("Translation and TTS are disabled for this test");
-
-    setTimeout(()=>{
-      if(running)$("orb").classList.remove("speaking");
-    },700);
-    $("start").disabled=true;
+    setTimeout(()=>{if(running)$("orb").classList.remove("speaking")},700);
     $("stop").disabled=false;
   }catch(e){
-    write(e?.message||String(e));
-    setStatus(e?.message||"Could not start call",true);
-    await stopCall();
+    const message=e?.message||String(e);
+    write(message);
+    setStatus(message,true);
+    starting=false;
+    if(c===client){
+      const old=client;client=null;
+      try{if(old?.connectionState!=="DISCONNECTED")await old.leave()}catch(_){}
+    }
+    if(localTrack){try{localTrack.close()}catch(_){}localTrack=null}
+    running=false;
+    $("start").disabled=false;$("stop").disabled=true;
   }
 }
 async function boot(){try{const r=await fetch("/api/config",{cache:"no-store"});config=await r.json();if(!config.agora_app_id)write("AGORA_APP_ID is not configured. Add it to the existing speakeasy-wigvo Render service.");else write("Agora SDK "+config.agora_sdk_version+" configured")}catch(e){write("Config error: "+(e?.message||e))}}
