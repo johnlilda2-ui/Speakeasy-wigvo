@@ -318,7 +318,11 @@ async def browser_translation(ws: WebSocket) -> None:
             state["translation_tts_sent"] = sent + cut
             state["translation_seq"] += 1
             try:
-                state["tts_queue"].put_nowait({"text": chunk, "end": False})
+                state["tts_queue"].put_nowait({
+                    "text": chunk,
+                    "end": False,
+                    "utterance_id": state["utterance_id"],
+                })
             except asyncio.QueueFull:
                 # Keep TTS bounded; if the queue is saturated, don't advance
                 # further until the worker catches up.
@@ -547,6 +551,8 @@ async def browser_translation(ws: WebSocket) -> None:
                         done = state["tts_done"].get(sid)
                         if done:
                             done.set()
+                        state["tts_streams"].pop(sid, None)
+                        state["tts_done"].pop(sid, None)
                         continue
 
                     audio = data.get("audio")
@@ -575,6 +581,8 @@ async def browser_translation(ws: WebSocket) -> None:
                         done = state["tts_done"].get(sid)
                         if done:
                             done.set()
+                        state["tts_streams"].pop(sid, None)
+                        state["tts_done"].pop(sid, None)
             except asyncio.CancelledError:
                 pass
 
