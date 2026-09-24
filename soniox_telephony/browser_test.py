@@ -180,11 +180,15 @@ async def browser_translation(ws: WebSocket) -> None:
             "sample_rate": 16000,
             "num_channels": 1,
             "language_hints": [source],
-            "language_hints_strict": True,
             "enable_endpoint_detection": True,
             "endpoint_latency_adjustment_level": 2,
             "endpoint_sensitivity": 0.3,
             "max_endpoint_delay_ms": SONIOX_ENDPOINT_DELAY_MS,
+            "context": {
+                "general": [
+                    {"key": "domain", "value": "live conversation"},
+                ],
+            },
             "translation": {
                 "type": "one_way",
                 "target_language": target,
