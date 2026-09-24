@@ -354,6 +354,35 @@ async def browser_translation(ws: WebSocket) -> None:
                     state["translation_partial"] = "".join(preview_translation)
                     state["translation_prev_hypothesis"] = previous_translation_hypothesis
 
+                    # Final translation tokens are append-only. Release their
+                    # newly confirmed text immediately at a natural word
+                    # boundary instead of waiting for endpoint detection.
+                    final_sent = int(state["translation_tts_sent"])
+                    final_text = state["final_translation"]
+                    if len(final_text) > final_sent:
+                        final_delta = final_text[final_sent:]
+                        boundary = -1
+                        for i, ch in enumerate(final_delta):
+                            if ch in " ,.!?:;":
+                                boundary = i
+                                break
+                        if boundary >= 0:
+                            cut = boundary + 1
+                            chunk = final_delta[:cut].strip()
+                            if len(chunk) >= 2:
+                                try:
+                                    state["tts_queue"].put_nowait({"text": chunk, "end": False})
+                                    state["translation_tts_sent"] = final_sent + cut
+                                    state["translation_seq"] += 1
+                                    await ws.send_json({
+                                        "type": "translation_text",
+                                        "text": chunk,
+                                        "final": False,
+                                        "chunk_id": f"tr-{state['translation_seq']}",
+                                    })
+                                except asyncio.QueueFull:
+                                    pass
+
                     current_original = (
                         final_original + "".join(preview_original)
                     ).strip()
