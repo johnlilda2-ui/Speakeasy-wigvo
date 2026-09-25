@@ -102,23 +102,33 @@ def main() -> int:
     download(HUBERT_URL, HUBERT_PATH)
 
     venv = ROOT / ".venv"
+    first_venv_pass = os.environ.get("OVC_BENCHMARK_VENV") != "1"
     if not venv.exists():
         run([sys.executable, "-m", "venv", str(venv)])
 
     py = venv / "bin" / "python"
     pip = venv / "bin" / "pip"
 
-    run([str(py), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
-    run([str(pip), "install", "-r", "backend/requirements.txt"], cwd=SOURCE)
-    run(
-        [
-            str(pip),
-            "install",
-            "--no-deps",
-            "git+https://github.com/RVC-Project/Retrieval-based-Voice-Conversion",
-        ],
-        cwd=SOURCE,
-    )
+    if first_venv_pass:
+        run([str(py), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
+        run([str(pip), "install", "-r", "backend/requirements.txt"], cwd=SOURCE)
+        run(
+            [
+                str(pip),
+                "install",
+                "--no-deps",
+                "git+https://github.com/RVC-Project/Retrieval-based-Voice-Conversion",
+            ],
+            cwd=SOURCE,
+        )
+
+        # The workflow invokes this file with the runner's Python, while the
+        # dependencies above are installed into the dedicated venv. Re-enter
+        # the benchmark with that venv interpreter so imports and runtime
+        # libraries come from the same environment that was just installed.
+        env = os.environ.copy()
+        env["OVC_BENCHMARK_VENV"] = "1"
+        os.execve(str(py), [str(py), str(Path(__file__).resolve()), *sys.argv[1:]], env)
 
     os.environ.update(
         {
