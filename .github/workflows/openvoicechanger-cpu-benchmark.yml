@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - bench/openvoicechanger-cpu
+  pull_request:
+    branches:
+      - feature/soniox-telephony-core
   workflow_dispatch:
 
 permissions:
