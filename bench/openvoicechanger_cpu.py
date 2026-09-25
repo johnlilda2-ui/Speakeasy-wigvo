@@ -110,7 +110,7 @@ def main() -> int:
     pip = venv / "bin" / "pip"
 
     if first_venv_pass:
-        run([str(py), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
+        run([str(py), "-m", "pip", "install", "--upgrade", "pip", "setuptools<81", "wheel"])
         run([str(pip), "install", "-r", "backend/requirements.txt"], cwd=SOURCE)
         run(
             [
