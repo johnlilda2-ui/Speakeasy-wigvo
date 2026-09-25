@@ -20,8 +20,16 @@ jobs:
       - name: Checkout benchmark branch
         uses: actions/checkout@v4
 
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
       - name: Show runner resources
         run: |
+          echo "Python:"
+          python --version
           echo "CPU:"
           nproc
           echo "Memory:"
@@ -36,4 +44,4 @@ jobs:
 
       - name: Run OpenVoiceChanger RVC CPU benchmark
         run: |
-          python3 bench/openvoicechanger_cpu.py
+          python bench/openvoicechanger_cpu.py
