@@ -46,7 +46,7 @@ AGORA_TOKEN_TTL_S = max(60, min(int(os.getenv("AGORA_TOKEN_TTL_S", "3600")), 864
 AGORA_CHANNEL_PREFIX = os.getenv("AGORA_CHANNEL_PREFIX", "speakeasy-").strip() or "speakeasy-"
 MAX_CALL_DURATION_S = max(60, int(os.getenv("MAX_CALL_DURATION_S", "1800")))
 
-app = FastAPI(title="SpeakEasy WIGVO — Soniox Telephony Core", version="0.1.0")
+app = FastAPI(title="WIGVO — Realtime Voice Translation", version="0.2.0")
 register_browser_route(app)
 register_browser_home(app)
 
@@ -442,9 +442,10 @@ async def agora_token(channel: str, uid: int) -> JSONResponse:
 async def health() -> dict[str, Any]:
     return {
         "status": "ok",
-        "app": "SpeakEasy WIGVO Soniox Telephony Core",
-        "version": "0.1.0",
-        "soniox_configured": bool(SONIOX_API_KEY),
+        "app": "WIGVO — Realtime Voice Translation",
+        "version": "0.2.0",
+        "krisp_configured": bool(os.getenv("KRISP_API_KEY", "").strip()),
+        "legacy_telephony_soniox_configured": bool(SONIOX_API_KEY),
         "twilio_configured": bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_PHONE_NUMBER),
     }
 
