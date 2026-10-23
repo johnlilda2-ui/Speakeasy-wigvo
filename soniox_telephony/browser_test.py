@@ -3,7 +3,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import os
+import re
 import urllib.error
 import urllib.request
 from typing import Any
@@ -11,10 +13,53 @@ from typing import Any
 import websockets
 from fastapi import WebSocket, WebSocketDisconnect
 
+logger = logging.getLogger("speakeasy_wigvo.krisp")
+
 KRISP_API_KEY = os.getenv("KRISP_API_KEY", "").strip()
 KRISP_TOKEN_URL = "https://api.developers.krisp.ai/v2/sdk/tokens/session"
 KRISP_VT_TOKEN_URL = "https://api.developers.krisp.ai/v2/sdk/voice-translation/session/token"
 KRISP_VT_URL = "wss://streaming.krisp.ai/vt"
+
+
+def _safe_krisp_http_error(exc: urllib.error.HTTPError) -> str:
+    """Summarize a Krisp HTTP failure without logging credentials or raw HTML."""
+    headers = exc.headers or {}
+    parts = [f"HTTP {exc.code}"]
+    for header, label in (
+        ("Content-Type", "content_type"),
+        ("Server", "server"),
+        ("CF-Ray", "cf_ray"),
+        ("CF-Mitigated", "cf_mitigated"),
+    ):
+        value = str(headers.get(header) or "").strip()
+        if value:
+            parts.append(f"{label}={re.sub(r'[^A-Za-z0-9._:/ -]', '', value)[:100]}")
+
+    raw = exc.read().decode("utf-8", errors="replace")
+    try:
+        payload = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        payload = None
+
+    if isinstance(payload, dict):
+        # Whitelist common diagnostic fields; never dump the full response object.
+        for key in ("error_code", "code", "message", "detail", "req_id", "request_id"):
+            value = payload.get(key)
+            if value is not None and isinstance(value, (str, int, float)):
+                safe_value = re.sub(r"[\r\n\t]+", " ", str(value))
+                safe_value = re.sub(r"[^A-Za-z0-9._:/ -]", "", safe_value)[:220]
+                if safe_value:
+                    parts.append(f"{key}={safe_value}")
+    else:
+        # Avoid logging arbitrary HTML or response text from an upstream service.
+        if re.search(r"cloudflare", raw, re.IGNORECASE):
+            parts.append("response_hint=cloudflare_page")
+        match = re.search(r"error\s*code\s*[:=]?\s*(\d{3,5})", raw, re.IGNORECASE)
+        if match:
+            parts.append(f"response_code={match.group(1)}")
+        elif not re.search(r"cloudflare", raw, re.IGNORECASE):
+            parts.append("response_hint=non_json_body")
+    return "; ".join(parts)
 AGORA_APP_ID = os.getenv("AGORA_APP_ID", "").strip()
 AGORA_SDK_VERSION = os.getenv("AGORA_SDK_VERSION", "4.24.8").strip()
 AGORA_CHANNEL_PREFIX = os.getenv("AGORA_CHANNEL_PREFIX", "speakeasy-").strip() or "speakeasy-"
@@ -24,25 +69,57 @@ def _create_session_token() -> str:
     if not KRISP_API_KEY:
         raise RuntimeError("KRISP_API_KEY is not configured on Render.")
     body = json.dumps({"usage_type": "vt", "expiration_ttl": 60}).encode()
-    headers = {"Authorization": f"api-key {KRISP_API_KEY}", "Content-Type": "application/json"}
+    headers = {
+        "Authorization": f"api-key {KRISP_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
     attempts = [
-        urllib.request.Request(KRISP_VT_TOKEN_URL, method="GET", headers={"Authorization": headers["Authorization"]}),
-        urllib.request.Request(KRISP_TOKEN_URL, data=body, method="POST", headers=headers),
+        ("voice_translation_session_token_get", urllib.request.Request(
+            KRISP_VT_TOKEN_URL,
+            method="GET",
+            headers={"Authorization": headers["Authorization"], "Accept": "application/json"},
+        )),
+        ("sdk_session_token_post", urllib.request.Request(
+            KRISP_TOKEN_URL,
+            data=body,
+            method="POST",
+            headers=headers,
+        )),
     ]
     last_error = "Krisp did not return a session token."
-    for req in attempts:
+    for endpoint_name, req in attempts:
         try:
             with urllib.request.urlopen(req, timeout=20) as response:
                 result = json.loads(response.read().decode())
+                status_code = getattr(response, "status", 200)
             token = ((result.get("data") or {}).get("session_key") or "").strip()
             if token:
+                logger.info(
+                    "Krisp session token created endpoint=%s method=%s status=%s",
+                    endpoint_name, req.get_method(), status_code,
+                )
                 return token
-            last_error = str(result.get("message") or result.get("error_code") or last_error)
+            safe_code = result.get("error_code") or result.get("code") or "unknown"
+            last_error = f"Krisp token endpoint {endpoint_name} returned no session_key (code={str(safe_code)[:80]})."
+            logger.warning(
+                "Krisp token attempt returned no session_key endpoint=%s method=%s status=%s code=%s",
+                endpoint_name, req.get_method(), status_code, str(safe_code)[:80],
+            )
         except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            last_error = f"Krisp token request failed ({exc.code}): {detail[:400]}"
+            detail = _safe_krisp_http_error(exc)
+            last_error = f"Krisp token request failed at {endpoint_name}: {detail}"
+            logger.warning(
+                "Krisp token request failed endpoint=%s method=%s %s",
+                endpoint_name, req.get_method(), detail,
+            )
         except Exception as exc:
-            last_error = f"Could not create a Krisp Voice Translation session token: {exc}"
+            # Do not log request headers, API keys, or session tokens.
+            last_error = f"Krisp token attempt failed at {endpoint_name} ({type(exc).__name__})."
+            logger.warning(
+                "Krisp token attempt failed endpoint=%s method=%s exception_type=%s",
+                endpoint_name, req.get_method(), type(exc).__name__,
+            )
     raise RuntimeError(last_error)
 
 def _get_supported_languages() -> set[str]:
