@@ -75,12 +75,17 @@ def _create_session_token() -> str:
         "Authorization": f"api-key {KRISP_API_KEY}",
         "Content-Type": "application/json",
         "Accept": "application/json",
+        "User-Agent": "WIGVO-Backend/1.0",
     }
     attempts = [
         ("voice_translation_session_token_get", urllib.request.Request(
             KRISP_VT_TOKEN_URL,
             method="GET",
-            headers={"Authorization": headers["Authorization"], "Accept": "application/json"},
+            headers={
+                "Authorization": headers["Authorization"],
+                "Accept": "application/json",
+                "User-Agent": headers["User-Agent"],
+            },
         )),
         ("sdk_session_token_post", urllib.request.Request(
             KRISP_TOKEN_URL,
