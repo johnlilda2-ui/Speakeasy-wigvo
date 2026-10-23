@@ -46,8 +46,10 @@ def _safe_krisp_http_error(exc: urllib.error.HTTPError) -> str:
         for key in ("error_code", "code", "message", "detail", "req_id", "request_id"):
             value = payload.get(key)
             if value is not None and isinstance(value, (str, int, float)):
-                safe_value = re.sub(r"[\r\n\t]+", " ", str(value))
-                safe_value = re.sub(r"[^A-Za-z0-9._:/ -]", "", safe_value)[:220]
+                raw_value = re.sub(r"[\r\n\t]+", " ", str(value))
+                if KRISP_API_KEY:
+                    raw_value = raw_value.replace(KRISP_API_KEY, "[redacted]")
+                safe_value = re.sub(r"[^A-Za-z0-9._:/ -]", "", raw_value)[:220]
                 if safe_value:
                     parts.append(f"{key}={safe_value}")
     else:
