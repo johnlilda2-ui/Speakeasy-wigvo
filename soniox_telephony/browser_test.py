@@ -99,9 +99,11 @@ async def browser_translation(ws: WebSocket) -> None:
             raise RuntimeError("Choose English (US) or Portuguese (Brazil) for both language fields.")
         if source == target:
             raise RuntimeError("The source language and target language must be different.")
-        supported = await asyncio.to_thread(_get_supported_languages)
-        if source not in supported or target not in supported:
-            raise RuntimeError(f"Krisp account does not currently list the required language pair {source} ↔ {target}.")
+        # Do not block a translation session on the language-catalog endpoint.
+        # Krisp may return an upstream HTTP 403 (including edge/WAF error 1010)
+        # for this informational endpoint even when session-token/VT access works.
+        # The VT session handshake validates the actual language pair and returns
+        # a structured validation error if Krisp cannot use it.
         voice = str(cfg.get("voice") or "female").lower()
         if voice not in {"male", "female"}:
             voice = "female"
