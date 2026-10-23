@@ -54,8 +54,28 @@ def _get_supported_languages() -> set[str]:
     try:
         with urllib.request.urlopen(request, timeout=15) as response:
             result = json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        # Krisp's response body may contain a useful error_code/message/req_id.
+        # Never log request headers or the API key.
+        detail = exc.read().decode("utf-8", errors="replace")
+        try:
+            payload = json.loads(detail)
+            error_code = payload.get("error_code") or payload.get("code")
+            message = payload.get("message") or payload.get("detail") or ""
+            req_id = payload.get("req_id") or ""
+            parts = [f"HTTP {exc.code}"]
+            if error_code:
+                parts.append(f"code={str(error_code)[:100]}")
+            if message:
+                parts.append(f"message={str(message)[:240]}")
+            if req_id:
+                parts.append(f"request_id={str(req_id)[:100]}")
+            safe_detail = "; ".join(parts)
+        except Exception:
+            safe_detail = f"HTTP {exc.code}: {detail[:240]}"
+        raise RuntimeError(f"Krisp supported-languages request failed: {safe_detail}") from exc
     except Exception as exc:
-        raise RuntimeError(f"Could not verify Krisp's supported languages: {exc}") from exc
+        raise RuntimeError(f"Could not verify Krisp's supported languages: {type(exc).__name__}: {str(exc)[:240]}") from exc
     entries = (result.get("data") or [])
     codes = {str(item.get("language_code") or "") for item in entries if isinstance(item, dict)}
     if not codes:
@@ -73,9 +93,12 @@ async def browser_translation(ws: WebSocket) -> None:
     try:
         cfg = await ws.receive_json()
         source = str(cfg.get("source_language") or "en-US")
-        if source not in {"en-US", "pt-BR"}:
-            raise RuntimeError("Choose English (US) or Portuguese (Brazil).")
-        target = "pt-BR" if source == "en-US" else "en-US"
+        target = str(cfg.get("target_language") or ("pt-BR" if source == "en-US" else "en-US"))
+        allowed_languages = {"en-US", "pt-BR"}
+        if source not in allowed_languages or target not in allowed_languages:
+            raise RuntimeError("Choose English (US) or Portuguese (Brazil) for both language fields.")
+        if source == target:
+            raise RuntimeError("The source language and target language must be different.")
         supported = await asyncio.to_thread(_get_supported_languages)
         if source not in supported or target not in supported:
             raise RuntimeError(f"Krisp account does not currently list the required language pair {source} ↔ {target}.")
@@ -187,7 +210,7 @@ BROWSER_HTML_PAGE = r'''<!doctype html><html lang="en"><head>
 </style></head><body><main>
 <div class="card"><h1 style="margin:0">WIGVO</h1><div class="muted">Live voice translation · Agora + Krisp</div></div>
 <div class="card"><div class="row"><div><label>Room code</label><input id="room" value="demo-room"></div><div><label>Language you speak</label><select id="src"><option value="en-US">English (US)</option><option value="pt-BR">Português (Brasil)</option></select></div></div>
-<label>Translated voice</label><select id="voice"><option value="female">Female</option><option value="male">Male</option></select>
+<div class="row"><div><label>Target language (what the listener hears)</label><select id="target"><option value="pt-BR">Português (Brasil)</option><option value="en-US">English (US)</option></select></div><div><label>Translated voice</label><select id="voice"><option value="female">Female</option><option value="male">Male</option></select></div></div>
 <p class="note">Both people use the same room code and select the language they speak. English is translated to Brazilian Portuguese and Brazilian Portuguese to English. Only translated audio is published to Agora. Use headphones to reduce echo.</p>
 <div class="controls"><button id="start" class="primary">Start call</button><button id="stop" class="danger" disabled>End call</button></div><div class="box"><span id="status">Ready</span><span id="uid" style="float:right"></span></div></div>
 <div class="card"><div class="muted">Recognized speech</div><div id="original" class="box">Waiting for speech…</div><div class="muted" style="margin-top:12px">Translation</div><div id="translated" class="box">Translated text appears here.</div></div>
@@ -204,11 +227,11 @@ async function stopCall(){running=false;starting=false;if(ws){try{if(ws.readySta
 async function startCall(){if(starting||running)return;starting=true;$("start").disabled=true;status("Connecting…");let c=null,resolveReady,rejectReady;
 try{await loadAgora();c=AgoraRTC.createClient({mode:"rtc",codec:"vp8"});client=c;const sub=async u=>{if(!u||c!==client||c.connectionState!=="CONNECTED"||!u.hasAudio)return;try{await c.subscribe(u,"audio");if(u.audioTrack)u.audioTrack.play()}catch(e){log("Remote audio: "+(e.message||e))}};c.on("user-published",async(u,t)=>{if(t==="audio")await sub(u)});const uid=Math.floor(100000+Math.random()*900000),room=channel();const r=await fetch("/api/agora-token?channel="+encodeURIComponent(room)+"&uid="+uid,{cache:"no-store"}),j=await r.json();if(!r.ok||!j.token)throw Error(j.detail||"Could not obtain Agora token");await c.join(config.agora_app_id,room,j.token,uid);stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
 ws=new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+"/api/browser");ws.onmessage=e=>{try{const d=JSON.parse(e.data);if(d.type==="ready"){log("Krisp ready: "+d.source_language+" → "+d.target_language);if(resolveReady){resolveReady();resolveReady=null}}else if(d.type==="error"){log("["+d.stage+"] "+d.message);status(d.message,true);if(rejectReady){rejectReady(Error(d.message));rejectReady=null}}else if(d.type==="audio")play(d.audio,d.sample_rate||16000);else if(d.type==="transcript"&&d.text)$("original").textContent=d.text;else if(d.type==="translate"&&d.text)$("translated").textContent=d.text}catch(err){log(err.message||err)}};
-await new Promise((ok,no)=>{ws.onopen=ok;ws.onerror=()=>no(Error("Could not connect to WIGVO voice pipeline"))});const ready=new Promise((ok,no)=>{resolveReady=ok;rejectReady=no;setTimeout(()=>no(Error("Krisp startup timed out")),50000)});ws.send(JSON.stringify({source_language:$("src").value,voice:$("voice").value}));await ready;
+await new Promise((ok,no)=>{ws.onopen=ok;ws.onerror=()=>no(Error("Could not connect to WIGVO voice pipeline"))});const ready=new Promise((ok,no)=>{resolveReady=ok;rejectReady=no;setTimeout(()=>no(Error("Krisp startup timed out")),50000)});ws.send(JSON.stringify({source_language:$("src").value,target_language:$("target").value,voice:$("voice").value}));await ready;
 playCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000,latencyHint:"interactive"});await playCtx.resume();destination=playCtx.createMediaStreamDestination();micCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000,latencyHint:"interactive"});await micCtx.resume();sourceNode=micCtx.createMediaStreamSource(stream);processor=micCtx.createScriptProcessor(1024,1,1);silent=micCtx.createGain();silent.gain.value=0;sourceNode.connect(processor);processor.connect(silent);silent.connect(micCtx.destination);processor.onaudioprocess=e=>{if(ws&&ws.readyState===1)try{ws.send(toPcm(e.inputBuffer.getChannelData(0)).buffer)}catch(err){}};
 track=AgoraRTC.createCustomAudioTrack({mediaStreamTrack:destination.stream.getAudioTracks()[0],encoderConfig:"speech_low_quality"});await c.publish([track]);for(const u of c.remoteUsers||[])await sub(u);running=true;starting=false;$("uid").textContent="UID "+uid;$("stop").disabled=false;status("Live translation connected");log("Joined "+room+"; translated audio only is published to Agora")
 }catch(e){log(e.message||String(e));status(e.message||String(e),true);starting=false;if(ws){try{ws.close()}catch(_){}ws=null}if(c===client){client=null;try{if(c.connectionState!=="DISCONNECTED")await c.leave()}catch(_){}}if(track){try{track.close()}catch(_){}track=null}if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}if(micCtx)try{await micCtx.close()}catch(_){}if(playCtx)try{await playCtx.close()}catch(_){}micCtx=playCtx=null;$("start").disabled=false;$("stop").disabled=true;running=false}}
-async function boot(){try{const r=await fetch("/api/config",{cache:"no-store"});config=await r.json();if(!config.agora_app_id)log("AGORA_APP_ID is not configured on Render.");if(!config.krisp_configured)log("KRISP_API_KEY must be added to the Render service.");else log("Krisp Voice Translation configured")}catch(e){log("Config error: "+e.message)}}
+$("src").addEventListener("change",()=>{const src=$("src").value;const target=$("target");if(src===target.value)target.value=src==="en-US"?"pt-BR":"en-US"});$("target").addEventListener("change",()=>{if($("src").value===$("target").value){log("Source and target languages must be different.");$("target").value=$("src").value==="en-US"?"pt-BR":"en-US"}});async function boot(){try{const r=await fetch("/api/config",{cache:"no-store"});config=await r.json();if(!config.agora_app_id)log("AGORA_APP_ID is not configured on Render.");if(!config.krisp_configured)log("KRISP_API_KEY must be added to the Render service.");else log("Krisp Voice Translation configured")}catch(e){log("Config error: "+e.message)}}
 $("start").onclick=startCall;$("stop").onclick=stopCall;window.addEventListener("beforeunload",()=>{if(ws&&ws.readyState===1)try{ws.send(JSON.stringify({type:"stop"}))}catch(e){}});boot();
 </script></body></html>'''
 
