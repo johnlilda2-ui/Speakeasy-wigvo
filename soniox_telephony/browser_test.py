@@ -13,6 +13,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 
 KRISP_API_KEY = os.getenv("KRISP_API_KEY", "").strip()
 KRISP_TOKEN_URL = "https://api.developers.krisp.ai/v2/sdk/tokens/session"
+KRISP_VT_TOKEN_URL = "https://api.developers.krisp.ai/v2/sdk/voice-translation/session/token"
 KRISP_VT_URL = "wss://streaming.krisp.ai/vt"
 AGORA_APP_ID = os.getenv("AGORA_APP_ID", "").strip()
 AGORA_SDK_VERSION = os.getenv("AGORA_SDK_VERSION", "4.24.8").strip()
@@ -23,21 +24,26 @@ def _create_session_token() -> str:
     if not KRISP_API_KEY:
         raise RuntimeError("KRISP_API_KEY is not configured on Render.")
     body = json.dumps({"usage_type": "vt", "expiration_ttl": 60}).encode()
-    req = urllib.request.Request(
-        KRISP_TOKEN_URL, data=body, method="POST",
-        headers={"Authorization": f"api-key {KRISP_API_KEY}", "Content-Type": "application/json"},
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=20) as response:
-            result = json.loads(response.read().decode())
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Krisp token request failed ({exc.code}): {detail[:400]}") from exc
-    token = ((result.get("data") or {}).get("session_key") or "").strip()
-    if not token:
-        raise RuntimeError(f"Krisp token error: {result.get('message') or result.get('error_code') or 'No session token returned'}")
-    return token
-
+    headers = {"Authorization": f"api-key {KRISP_API_KEY}", "Content-Type": "application/json"}
+    attempts = [
+        urllib.request.Request(KRISP_VT_TOKEN_URL, method="GET", headers={"Authorization": headers["Authorization"]}),
+        urllib.request.Request(KRISP_TOKEN_URL, data=body, method="POST", headers=headers),
+    ]
+    last_error = "Krisp did not return a session token."
+    for req in attempts:
+        try:
+            with urllib.request.urlopen(req, timeout=20) as response:
+                result = json.loads(response.read().decode())
+            token = ((result.get("data") or {}).get("session_key") or "").strip()
+            if token:
+                return token
+            last_error = str(result.get("message") or result.get("error_code") or last_error)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            last_error = f"Krisp token request failed ({exc.code}): {detail[:400]}"
+        except Exception as exc:
+            last_error = f"Could not create a Krisp Voice Translation session token: {exc}"
+    raise RuntimeError(last_error)
 
 async def browser_translation(ws: WebSocket) -> None:
     await ws.accept()
@@ -168,7 +174,7 @@ BROWSER_HTML_PAGE = r'''<!doctype html><html lang="en"><head>
 <div class="card"><div class="muted">Session log</div><div id="log" class="log"></div></div>
 </main><script>
 let AgoraRTC=null,client=null,track=null,stream=null,micCtx=null,playCtx=null,processor=null,sourceNode=null,silent=null,destination=null,ws=null,config=null,starting=false,running=false,playAt=0,queued=[];
-const $=id=>document.getElementById(id),log=s=>{$("log").textContent+=s+"\\n";$("log").scrollTop=$("log").scrollHeight},status=(s,bad=false)=>{$("status").textContent=s;$("status").className=bad?"error":""};
+const $=id=>document.getElementById(id),log=s=>{$("log").textContent+=s+"\n";$("log").scrollTop=$("log").scrollHeight},status=(s,bad=false)=>{$("status").textContent=s;$("status").className=bad?"error":""};
 const cleanRoom=s=>String(s||"demo-room").toLowerCase().replace(/[^a-z0-9_-]/g,"").slice(0,40)||"demo-room";
 const channel=()=>(config.agora_channel_prefix||"speakeasy-")+cleanRoom($("room").value);
 function toPcm(a){const o=new Int16Array(a.length);for(let i=0;i<a.length;i++){const v=Math.max(-1,Math.min(1,a[i]));o[i]=v<0?v*32768:v*32767}return o}
