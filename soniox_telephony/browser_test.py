@@ -65,7 +65,7 @@ async def browser_translation(ws: WebSocket) -> None:
         token = await asyncio.to_thread(_create_session_token)
         upstream = await websockets.connect(
             KRISP_VT_URL,
-            additional_headers={"Authorization": f"api-key {token}"},
+            additional_headers={"Authorization": f"Api-Key {token}"},
             ping_interval=20, ping_timeout=20, close_timeout=5, max_size=8 * 1024 * 1024,
         )
         await upstream.send(json.dumps({"config": {
