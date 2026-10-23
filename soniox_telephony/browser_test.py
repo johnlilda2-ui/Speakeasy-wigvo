@@ -45,6 +45,23 @@ def _create_session_token() -> str:
             last_error = f"Could not create a Krisp Voice Translation session token: {exc}"
     raise RuntimeError(last_error)
 
+def _get_supported_languages() -> set[str]:
+    request = urllib.request.Request(
+        "https://api.developers.krisp.ai/v2/sdk/voice-translation/languages",
+        headers={"Authorization": f"api-key {KRISP_API_KEY}"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            result = json.loads(response.read().decode())
+    except Exception as exc:
+        raise RuntimeError(f"Could not verify Krisp's supported languages: {exc}") from exc
+    entries = (result.get("data") or [])
+    codes = {str(item.get("language_code") or "") for item in entries if isinstance(item, dict)}
+    if not codes:
+        raise RuntimeError("Krisp returned no supported language codes.")
+    return codes
+
 async def browser_translation(ws: WebSocket) -> None:
     await ws.accept()
     if not KRISP_API_KEY:
@@ -59,6 +76,9 @@ async def browser_translation(ws: WebSocket) -> None:
         if source not in {"en-US", "pt-BR"}:
             raise RuntimeError("Choose English (US) or Portuguese (Brazil).")
         target = "pt-BR" if source == "en-US" else "en-US"
+        supported = await asyncio.to_thread(_get_supported_languages)
+        if source not in supported or target not in supported:
+            raise RuntimeError(f"Krisp account does not currently list the required language pair {source} ↔ {target}.")
         voice = str(cfg.get("voice") or "female").lower()
         if voice not in {"male", "female"}:
             voice = "female"
