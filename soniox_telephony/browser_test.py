@@ -183,6 +183,8 @@ async def browser_translation(ws: WebSocket) -> None:
     frame_timeline_batch = 0
     input_send_seq = 0
     output_recv_seq = 0
+    transcript_event_seq = 0
+    translate_event_seq = 0
     metrics: dict[str, Any] = {
         "started_at": time.monotonic(),
         "input_frames": 0, "input_bytes": 0, "input_frame_min": None, "input_frame_max": None,
@@ -193,6 +195,14 @@ async def browser_translation(ws: WebSocket) -> None:
         "output_interval_sum_ms": 0.0, "output_interval_min_ms": None, "output_interval_max_ms": None,
         "first_krisp_send_started_at": None, "first_krisp_send_completed_at": None,
         "first_output_forwarded_at": None, "first_transcript_at": None, "first_translate_at": None,
+        "first_final_transcript_at": None, "first_final_translate_at": None,
+        "transcript_events": 0, "transcript_final_events": 0,
+        "translate_events": 0, "translate_final_events": 0,
+        "output_frames_before_final_translate": 0,
+        "playback_scheduled_frames": 0, "playback_end_events": 0,
+        "playback_not_played_frames": 0, "playback_interrupted_frames": 0,
+        "first_playback_schedule_client_ms": None, "last_playback_end_client_ms": None,
+        "playback_queue_ahead_max_ms": None,
     }
 
     def mark_timing(name: str, at: float | None = None) -> None:
@@ -377,6 +387,7 @@ async def browser_translation(ws: WebSocket) -> None:
                                     "output_frame_bytes_min", "output_frame_bytes_max",
                                     "output_interval_ms_avg", "output_interval_ms_min",
                                     "output_interval_ms_max", "first_output_audio_ms_from_first_input",
+                                    "playback_pending_frames",
                                 )
                                 fields = []
                                 for key in allowed:
@@ -384,6 +395,44 @@ async def browser_translation(ws: WebSocket) -> None:
                                     if value is not None:
                                         fields.append(f"{key}={value}")
                                 logger.info("Browser audio diagnostics stage=%s %s", stage, " ".join(fields))
+                        elif control.get("type") == "playback_diagnostics":
+                            diagnostic_events = control.get("events")
+                            if isinstance(diagnostic_events, list):
+                                for diagnostic in diagnostic_events[:32]:
+                                    if not isinstance(diagnostic, dict):
+                                        continue
+                                    kind = diagnostic.get("kind")
+                                    if kind not in {"scheduled", "ended", "not_played", "interrupted"}:
+                                        continue
+                                    seq = safe_number(diagnostic.get("seq"))
+                                    client_ms = safe_number(diagnostic.get("at_ms"))
+                                    if kind == "scheduled":
+                                        metrics["playback_scheduled_frames"] += 1
+                                        if metrics["first_playback_schedule_client_ms"] is None:
+                                            metrics["first_playback_schedule_client_ms"] = safe_number(diagnostic.get("start_ms"))
+                                        queue_ahead = safe_number(diagnostic.get("queue_ahead_ms"))
+                                        if queue_ahead is not None:
+                                            old_max = metrics["playback_queue_ahead_max_ms"]
+                                            metrics["playback_queue_ahead_max_ms"] = queue_ahead if old_max is None else max(old_max, queue_ahead)
+                                    elif kind == "ended":
+                                        metrics["playback_end_events"] += 1
+                                        metrics["last_playback_end_client_ms"] = safe_number(diagnostic.get("end_callback_ms"))
+                                    elif kind == "not_played":
+                                        metrics["playback_not_played_frames"] += 1
+                                    elif kind == "interrupted":
+                                        metrics["playback_interrupted_frames"] += 1
+                                    prefix = {"scheduled": "PS", "ended": "PE", "not_played": "PN", "interrupted": "PI"}[kind]
+                                    fields = [f"at={client_ms}"]
+                                    for key in ("rx_ms", "start_ms", "end_ms", "start_ctx_ms", "end_ctx_ms",
+                                                "end_callback_ms", "end_callback_ctx_ms", "end_callback_late_ms",
+                                                "queue_ahead_ms", "frame_ms", "remaining_ms"):
+                                        value = safe_number(diagnostic.get(key))
+                                        if value is not None:
+                                            fields.append(f"{key}={value}")
+                                    reason = diagnostic.get("reason")
+                                    if isinstance(reason, str) and reason in {"no_audio_context", "no_stream_destination", "muted", "session_stop", "empty_frame"}:
+                                        fields.append(f"reason={reason}")
+                                    add_frame_timeline(f"{prefix}{int(seq) if seq is not None else 0}[{','.join(fields)}]")
                         elif control.get("type") == "stop":
                             return
                     except (json.JSONDecodeError, TypeError):
@@ -396,13 +445,15 @@ async def browser_translation(ws: WebSocket) -> None:
                     output_received_at = time.monotonic()
                     record_frame("output", len(raw), output_received_at)
                     output_recv_seq += 1
+                    if metrics["first_final_translate_at"] is None:
+                        metrics["output_frames_before_final_translate"] += 1
                     if metrics["output_first_at"] == output_received_at:
                         mark_timing("first_output_received", output_received_at)
                     add_frame_timeline(
                         f"O{output_recv_seq}[r={elapsed_ms(output_received_at)},b={len(raw)}]"
                     )
                     browser_send_started_at = time.monotonic()
-                    await ws.send_json({"type": "audio", "audio": base64.b64encode(raw).decode("ascii"), "sample_rate": 16000})
+                    await ws.send_json({"type": "audio", "seq": output_recv_seq, "audio": base64.b64encode(raw).decode("ascii"), "sample_rate": 16000})
                     browser_send_completed_at = time.monotonic()
                     if metrics["first_output_forwarded_at"] is None:
                         metrics["first_output_forwarded_at"] = browser_send_completed_at
@@ -417,10 +468,41 @@ async def browser_translation(ws: WebSocket) -> None:
                     event = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
-                if isinstance(event.get("transcript"), dict) and metrics["first_transcript_at"] is None:
-                    metrics["first_transcript_at"] = time.monotonic()
-                if isinstance(event.get("translate"), dict) and metrics["first_translate_at"] is None:
-                    metrics["first_translate_at"] = time.monotonic()
+                upstream_event_at = time.monotonic()
+                transcript_item = event.get("transcript")
+                if isinstance(transcript_item, dict):
+                    transcript_event_seq += 1
+                    metrics["transcript_events"] += 1
+                    transcript_final = bool(transcript_item.get("final"))
+                    if transcript_final:
+                        metrics["transcript_final_events"] += 1
+                        if metrics["first_final_transcript_at"] is None:
+                            metrics["first_final_transcript_at"] = upstream_event_at
+                    if metrics["first_transcript_at"] is None:
+                        metrics["first_transcript_at"] = upstream_event_at
+                    transcript_text_len = len(str(transcript_item.get("text") or ""))
+                    transcript_duration = safe_number(transcript_item.get("duration"))
+                    add_frame_timeline(
+                        f"T{transcript_event_seq}[t={elapsed_ms(upstream_event_at)},"
+                        f"final={int(transcript_final)},chars={transcript_text_len},"
+                        f"dur={transcript_duration}]"
+                    )
+                translate_item = event.get("translate")
+                if isinstance(translate_item, dict):
+                    translate_event_seq += 1
+                    metrics["translate_events"] += 1
+                    translate_final = bool(translate_item.get("final"))
+                    if translate_final:
+                        metrics["translate_final_events"] += 1
+                        if metrics["first_final_translate_at"] is None:
+                            metrics["first_final_translate_at"] = upstream_event_at
+                    if metrics["first_translate_at"] is None:
+                        metrics["first_translate_at"] = upstream_event_at
+                    translate_text_len = len(str(translate_item.get("text") or ""))
+                    add_frame_timeline(
+                        f"X{translate_event_seq}[t={elapsed_ms(upstream_event_at)},"
+                        f"final={int(translate_final)},chars={translate_text_len}]"
+                    )
                 err = event.get("error")
                 if event.get("type") == "error" or err:
                     logger.warning(
@@ -483,7 +565,12 @@ async def browser_translation(ws: WebSocket) -> None:
             "first_output_from_ready_ms=%s first_output_after_first_krisp_send_ms=%s "
             "first_output_after_first_send_done_ms=%s first_transcript_from_session_ms=%s "
             "first_translate_from_session_ms=%s first_translate_after_first_input_ms=%s "
-            "first_output_forwarded_from_session_ms=%s",
+            "first_output_forwarded_from_session_ms=%s first_final_transcript_from_session_ms=%s "
+            "first_final_translate_from_session_ms=%s transcript_events=%d transcript_final_events=%d "
+            "translate_events=%d translate_final_events=%d output_frames_before_final_translate=%d "
+            "playback_scheduled_frames=%d playback_end_events=%d playback_not_played_frames=%d "
+            "playback_interrupted_frames=%d first_playback_schedule_client_ms=%s "
+            "last_playback_end_client_ms=%s playback_queue_ahead_max_ms=%s",
             session_tag, (now - metrics["started_at"]) * 1000.0,
             elapsed_ms(first_input_at),
             elapsed_ms(metrics["first_krisp_send_started_at"]),
@@ -497,6 +584,15 @@ async def browser_translation(ws: WebSocket) -> None:
             round((metrics["first_translate_at"] - first_input_at) * 1000.0, 2)
             if metrics["first_translate_at"] is not None and first_input_at is not None else None,
             elapsed_ms(metrics["first_output_forwarded_at"]),
+            elapsed_ms(metrics["first_final_transcript_at"]),
+            elapsed_ms(metrics["first_final_translate_at"]),
+            metrics["transcript_events"], metrics["transcript_final_events"],
+            metrics["translate_events"], metrics["translate_final_events"],
+            metrics["output_frames_before_final_translate"],
+            metrics["playback_scheduled_frames"], metrics["playback_end_events"],
+            metrics["playback_not_played_frames"], metrics["playback_interrupted_frames"],
+            metrics["first_playback_schedule_client_ms"], metrics["last_playback_end_client_ms"],
+            metrics["playback_queue_ahead_max_ms"],
         )
         for task in tasks:
             if not task.done():
@@ -528,29 +624,63 @@ BROWSER_HTML_PAGE = r'''<!doctype html><html lang="en"><head>
 <div class="card"><div class="muted">Recognized speech</div><div id="original" class="box">Waiting for speech…</div><div class="muted" style="margin-top:12px">Translation</div><div id="translated" class="box">Translated text appears here.</div></div>
 <div class="card"><div class="muted">Session log</div><div id="log" class="log"></div></div>
 </main><script>
-let AgoraRTC=null,client=null,track=null,stream=null,micCtx=null,playCtx=null,processor=null,sourceNode=null,silent=null,destination=null,ws=null,config=null,starting=false,running=false,playAt=0,queued=[],micMuted=false,micPaused=false,myAudioMuted=false,otherSpeakerMuted=false,remoteAudioTracks=new Set();
+let AgoraRTC=null,client=null,track=null,stream=null,micCtx=null,playCtx=null,processor=null,sourceNode=null,silent=null,destination=null,ws=null,config=null,starting=false,running=false,playAt=0,queued=[],micMuted=false,micPaused=false,myAudioMuted=false,otherSpeakerMuted=false,remoteAudioTracks=new Set(),clientSessionStartPerf=0,playCtxAnchorPerf=0,playCtxAnchorTime=0,playbackDiagBuffer=[];
 const makeAudioStats=()=>({frames:0,bytes:0,samples:0,minFrameBytes:null,maxFrameBytes:null,firstAt:null,lastAt:null,intervalCount:0,intervalSum:0,minInterval:null,maxInterval:null});
 let clientInputStats=makeAudioStats(),clientOutputStats=makeAudioStats();
 function recordClientAudio(stats,bytes,samples,now=performance.now()){stats.frames++;stats.bytes+=bytes;stats.samples+=samples;stats.minFrameBytes=stats.minFrameBytes===null?bytes:Math.min(stats.minFrameBytes,bytes);stats.maxFrameBytes=stats.maxFrameBytes===null?bytes:Math.max(stats.maxFrameBytes,bytes);if(stats.firstAt===null)stats.firstAt=now;if(stats.lastAt!==null){const gap=Math.max(0,now-stats.lastAt);stats.intervalCount++;stats.intervalSum+=gap;stats.minInterval=stats.minInterval===null?gap:Math.min(stats.minInterval,gap);stats.maxInterval=stats.maxInterval===null?gap:Math.max(stats.maxInterval,gap)}stats.lastAt=now}
 function avgClientInterval(stats){return stats.intervalCount?Math.round(stats.intervalSum/stats.intervalCount*100)/100:null}
-function sendAudioDiagnostics(stage){if(!ws||ws.readyState!==1)return;const outputFirstAfterInput=clientOutputStats.firstAt!==null&&clientInputStats.firstAt!==null?Math.round((clientOutputStats.firstAt-clientInputStats.firstAt)*100)/100:null;ws.send(JSON.stringify({type:"audio_diagnostics",stage,mic_sample_rate:micCtx?micCtx.sampleRate:null,play_sample_rate:playCtx?playCtx.sampleRate:null,input_buffer_size:processor?processor.bufferSize:null,input_callback_count:clientInputStats.frames,input_samples:clientInputStats.samples,input_bytes:clientInputStats.bytes,input_frame_bytes_min:clientInputStats.minFrameBytes,input_frame_bytes_max:clientInputStats.maxFrameBytes,input_callback_interval_ms_avg:avgClientInterval(clientInputStats),input_callback_interval_ms_min:clientInputStats.minInterval===null?null:Math.round(clientInputStats.minInterval*100)/100,input_callback_interval_ms_max:clientInputStats.maxInterval===null?null:Math.round(clientInputStats.maxInterval*100)/100,output_audio_frames:clientOutputStats.frames,output_audio_bytes:clientOutputStats.bytes,output_frame_bytes_min:clientOutputStats.minFrameBytes,output_frame_bytes_max:clientOutputStats.maxFrameBytes,output_interval_ms_avg:avgClientInterval(clientOutputStats),output_interval_ms_min:clientOutputStats.minInterval===null?null:Math.round(clientOutputStats.minInterval*100)/100,output_interval_ms_max:clientOutputStats.maxInterval===null?null:Math.round(clientOutputStats.maxInterval*100)/100,first_output_audio_ms_from_first_input:outputFirstAfterInput}))}
+function diagRound(v){return Number.isFinite(v)?Math.round(v*100)/100:null}
+function audioCtxSessionMs(ctxTime){if(!playCtxAnchorPerf||!Number.isFinite(ctxTime))return null;return diagRound(playCtxAnchorPerf+(ctxTime-playCtxAnchorTime)*1000-clientSessionStartPerf)}
+function pushPlaybackDiag(event){playbackDiagBuffer.push(event);flushPlaybackDiagnostics(false)}
+function flushPlaybackDiagnostics(force=false){if(!ws||ws.readyState!==1)return;if(!force&&playbackDiagBuffer.length<16)return;while(playbackDiagBuffer.length){const batch=playbackDiagBuffer.splice(0,32);try{ws.send(JSON.stringify({type:"playback_diagnostics",events:batch}))}catch(e){playbackDiagBuffer=batch.concat(playbackDiagBuffer);return}if(!force&&playbackDiagBuffer.length<16)break}}
+function interruptQueuedPlayback(reason){const now=performance.now(),ctx=playCtx?playCtx.currentTime:null;for(const n of queued){if(n.__wigvoSeq===undefined)continue;n.__wigvoInterrupted=true;pushPlaybackDiag({kind:"interrupted",seq:n.__wigvoSeq,at_ms:diagRound(now-clientSessionStartPerf),end_ctx_ms:ctx===null?null:diagRound(ctx*1000),remaining_ms:ctx===null?null:diagRound(Math.max(0,(n.__wigvoEndCtx-ctx)*1000)),reason})}}
+function sendAudioDiagnostics(stage){if(!ws||ws.readyState!==1)return;const outputFirstAfterInput=clientOutputStats.firstAt!==null&&clientInputStats.firstAt!==null?Math.round((clientOutputStats.firstAt-clientInputStats.firstAt)*100)/100:null;ws.send(JSON.stringify({type:"audio_diagnostics",stage,playback_pending_frames:queued.length,mic_sample_rate:micCtx?micCtx.sampleRate:null,play_sample_rate:playCtx?playCtx.sampleRate:null,input_buffer_size:processor?processor.bufferSize:null,input_callback_count:clientInputStats.frames,input_samples:clientInputStats.samples,input_bytes:clientInputStats.bytes,input_frame_bytes_min:clientInputStats.minFrameBytes,input_frame_bytes_max:clientInputStats.maxFrameBytes,input_callback_interval_ms_avg:avgClientInterval(clientInputStats),input_callback_interval_ms_min:clientInputStats.minInterval===null?null:Math.round(clientInputStats.minInterval*100)/100,input_callback_interval_ms_max:clientInputStats.maxInterval===null?null:Math.round(clientInputStats.maxInterval*100)/100,output_audio_frames:clientOutputStats.frames,output_audio_bytes:clientOutputStats.bytes,output_frame_bytes_min:clientOutputStats.minFrameBytes,output_frame_bytes_max:clientOutputStats.maxFrameBytes,output_interval_ms_avg:avgClientInterval(clientOutputStats),output_interval_ms_min:clientOutputStats.minInterval===null?null:Math.round(clientOutputStats.minInterval*100)/100,output_interval_ms_max:clientOutputStats.maxInterval===null?null:Math.round(clientOutputStats.maxInterval*100)/100,first_output_audio_ms_from_first_input:outputFirstAfterInput}))}
 const $=id=>document.getElementById(id),log=s=>{$("log").textContent+=s+"\n";$("log").scrollTop=$("log").scrollHeight},status=(s,bad=false)=>{$("status").textContent=s;$("status").className=bad?"error":""};
 const cleanRoom=s=>String(s||"demo-room").toLowerCase().replace(/[^a-z0-9_-]/g,"").slice(0,40)||"demo-room";
 const channel=()=>(config.agora_channel_prefix||"speakeasy-")+cleanRoom($("room").value);
 function toPcm(a){const o=new Int16Array(a.length);for(let i=0;i<a.length;i++){const v=Math.max(-1,Math.min(1,a[i]));o[i]=v<0?v*32768:v*32767}return o}
-function play(b64,rate){const bytes=Uint8Array.from(atob(b64),c=>c.charCodeAt(0));recordClientAudio(clientOutputStats,bytes.byteLength,Math.floor(bytes.byteLength/2));if(!playCtx||!destination||myAudioMuted)return;const samples=new Int16Array(bytes.buffer,bytes.byteOffset,Math.floor(bytes.byteLength/2));if(!samples.length)return;const b=playCtx.createBuffer(1,samples.length,rate),d=b.getChannelData(0);for(let i=0;i<samples.length;i++)d[i]=samples[i]/32768;const n=playCtx.createBufferSource();n.buffer=b;n.connect(destination);playAt=Math.max(playAt,playCtx.currentTime+.02);n.start(playAt);playAt+=b.duration;queued.push(n);n.onended=()=>queued=queued.filter(x=>x!==n)}
+function play(b64,rate,seq){
+ const receivedAt=performance.now(),bytes=Uint8Array.from(atob(b64),c=>c.charCodeAt(0));
+ recordClientAudio(clientOutputStats,bytes.byteLength,Math.floor(bytes.byteLength/2),receivedAt);
+ const seqNo=Number.isFinite(Number(seq))?Number(seq):null,rxMs=diagRound(receivedAt-clientSessionStartPerf);
+ const samples=new Int16Array(bytes.buffer,bytes.byteOffset,Math.floor(bytes.byteLength/2));
+ if(!playCtx||!destination||myAudioMuted||!samples.length){
+  pushPlaybackDiag({kind:"not_played",seq:seqNo,at_ms:rxMs,rx_ms:rxMs,bytes:bytes.byteLength,
+   reason:!playCtx?"no_audio_context":!destination?"no_stream_destination":myAudioMuted?"muted":"empty_frame"});
+  return
+ }
+ const b=playCtx.createBuffer(1,samples.length,rate),d=b.getChannelData(0);
+ for(let i=0;i<samples.length;i++)d[i]=samples[i]/32768;
+ const n=playCtx.createBufferSource();n.buffer=b;n.connect(destination);
+ const scheduledStart=Math.max(playAt,playCtx.currentTime+.02),scheduledEnd=scheduledStart+b.duration;
+ const queueAheadMs=Math.max(0,(scheduledStart-playCtx.currentTime)*1000);
+ n.__wigvoSeq=seqNo;n.__wigvoEndCtx=scheduledEnd;
+ n.onended=()=>{
+  const callbackAt=performance.now(),ctxNow=playCtx?playCtx.currentTime:null;
+  if(!n.__wigvoInterrupted)pushPlaybackDiag({kind:"ended",seq:seqNo,at_ms:diagRound(callbackAt-clientSessionStartPerf),
+   rx_ms:rxMs,start_ms:audioCtxSessionMs(scheduledStart),end_ms:audioCtxSessionMs(scheduledEnd),
+   end_callback_ms:diagRound(callbackAt-clientSessionStartPerf),end_callback_ctx_ms:ctxNow===null?null:diagRound(ctxNow*1000),
+   end_callback_late_ms:ctxNow===null?null:diagRound((ctxNow-scheduledEnd)*1000),frame_ms:diagRound(b.duration*1000)});
+  queued=queued.filter(x=>x!==n)
+ };
+ n.start(scheduledStart);playAt=scheduledEnd;queued.push(n);
+ pushPlaybackDiag({kind:"scheduled",seq:seqNo,at_ms:rxMs,rx_ms:rxMs,
+  start_ms:audioCtxSessionMs(scheduledStart),end_ms:audioCtxSessionMs(scheduledEnd),
+  start_ctx_ms:diagRound(scheduledStart*1000),end_ctx_ms:diagRound(scheduledEnd*1000),
+  queue_ahead_ms:diagRound(queueAheadMs),frame_ms:diagRound(b.duration*1000),bytes:bytes.byteLength});
+}
 async function loadAgora(){if(AgoraRTC)return;await new Promise((ok,no)=>{const s=document.createElement("script");s.src="https://download.agora.io/sdk/release/AgoraRTC_N-"+encodeURIComponent(config.agora_sdk_version)+".js";s.onload=ok;s.onerror=()=>no(Error("Could not load Agora Web SDK"));document.head.appendChild(s)});AgoraRTC=window.AgoraRTC}
-function updateAudioButtons(){const live=running;for(const id of ["micMute","micPause","myAudioMute","otherSpeakerMute"])$(id).disabled=!live;$("micMute").textContent=micMuted?"Unmute microphone":"Mute microphone";$("micMute").setAttribute("aria-pressed",String(micMuted));$("micPause").textContent=micPaused?"Resume microphone":"Pause microphone";$("micPause").setAttribute("aria-pressed",String(micPaused));$("myAudioMute").textContent=myAudioMuted?"Unmute translated audio":"Mute translated audio";$("myAudioMute").setAttribute("aria-pressed",String(myAudioMuted));$("otherSpeakerMute").textContent=otherSpeakerMuted?"Unmute other speaker":"Mute other speaker";$("otherSpeakerMute").setAttribute("aria-pressed",String(otherSpeakerMuted))}function setRemoteSpeakerMuted(muted){otherSpeakerMuted=muted;for(const t of remoteAudioTracks){try{t.setVolume(muted?0:100)}catch(e){}}updateAudioButtons()}async function stopCall(){running=false;starting=false;micMuted=false;micPaused=false;myAudioMuted=false;otherSpeakerMuted=false;remoteAudioTracks.clear();if(ws){try{if(ws.readyState===1){sendAudioDiagnostics("audio_summary");ws.send(JSON.stringify({type:"stop"}))}ws.close()}catch(e){}}ws=null;if(processor)try{processor.disconnect()}catch(e){}if(sourceNode)try{sourceNode.disconnect()}catch(e){}if(silent)try{silent.disconnect()}catch(e){}processor=sourceNode=silent=null;queued.forEach(n=>{try{n.stop()}catch(e){}});queued=[];const c=client;client=null;if(track){try{if(c&&c.connectionState==="CONNECTED")await c.unpublish([track])}catch(e){}try{track.close()}catch(e){}track=null}if(c)try{if(c.connectionState!=="DISCONNECTED")await c.leave()}catch(e){}if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}if(micCtx)try{await micCtx.close()}catch(e){}if(playCtx)try{await playCtx.close()}catch(e){}micCtx=playCtx=null;destination=null;$("start").disabled=false;$("stop").disabled=true;updateAudioButtons();status("Ready")}
-async function startCall(){if(starting||running)return;clientInputStats=makeAudioStats();clientOutputStats=makeAudioStats();playAt=0;queued=[];starting=true;$("start").disabled=true;status("Connecting…");let c=null,resolveReady,rejectReady;
+function updateAudioButtons(){const live=running;for(const id of ["micMute","micPause","myAudioMute","otherSpeakerMute"])$(id).disabled=!live;$("micMute").textContent=micMuted?"Unmute microphone":"Mute microphone";$("micMute").setAttribute("aria-pressed",String(micMuted));$("micPause").textContent=micPaused?"Resume microphone":"Pause microphone";$("micPause").setAttribute("aria-pressed",String(micPaused));$("myAudioMute").textContent=myAudioMuted?"Unmute translated audio":"Mute translated audio";$("myAudioMute").setAttribute("aria-pressed",String(myAudioMuted));$("otherSpeakerMute").textContent=otherSpeakerMuted?"Unmute other speaker":"Mute other speaker";$("otherSpeakerMute").setAttribute("aria-pressed",String(otherSpeakerMuted))}function setRemoteSpeakerMuted(muted){otherSpeakerMuted=muted;for(const t of remoteAudioTracks){try{t.setVolume(muted?0:100)}catch(e){}}updateAudioButtons()}async function stopCall(){running=false;starting=false;micMuted=false;micPaused=false;myAudioMuted=false;otherSpeakerMuted=false;remoteAudioTracks.clear();interruptQueuedPlayback("session_stop");if(ws){try{if(ws.readyState===1){flushPlaybackDiagnostics(true);sendAudioDiagnostics("audio_summary");ws.send(JSON.stringify({type:"stop"}))}ws.close()}catch(e){}}ws=null;if(processor)try{processor.disconnect()}catch(e){}if(sourceNode)try{sourceNode.disconnect()}catch(e){}if(silent)try{silent.disconnect()}catch(e){}processor=sourceNode=silent=null;queued.forEach(n=>{try{n.stop()}catch(e){}});queued=[];const c=client;client=null;if(track){try{if(c&&c.connectionState==="CONNECTED")await c.unpublish([track])}catch(e){}try{track.close()}catch(e){}track=null}if(c)try{if(c.connectionState!=="DISCONNECTED")await c.leave()}catch(e){}if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}if(micCtx)try{await micCtx.close()}catch(e){}if(playCtx)try{await playCtx.close()}catch(e){}micCtx=playCtx=null;destination=null;$("start").disabled=false;$("stop").disabled=true;updateAudioButtons();status("Ready")}
+async function startCall(){if(starting||running)return;clientInputStats=makeAudioStats();clientOutputStats=makeAudioStats();playbackDiagBuffer=[];clientSessionStartPerf=0;playCtxAnchorPerf=0;playCtxAnchorTime=0;playAt=0;queued=[];starting=true;$("start").disabled=true;status("Connecting…");let c=null,resolveReady,rejectReady;
 try{await loadAgora();c=AgoraRTC.createClient({mode:"rtc",codec:"vp8"});client=c;const sub=async u=>{if(!u||c!==client||c.connectionState!=="CONNECTED"||!u.hasAudio)return;try{await c.subscribe(u,"audio");if(u.audioTrack){remoteAudioTracks.add(u.audioTrack);u.audioTrack.setVolume(otherSpeakerMuted?0:100);u.audioTrack.play()}}catch(e){log("Remote audio: "+(e.message||e))}};c.on("user-published",async(u,t)=>{if(t==="audio")await sub(u)});const uid=Math.floor(100000+Math.random()*900000),room=channel();const r=await fetch("/api/agora-token?channel="+encodeURIComponent(room)+"&uid="+uid,{cache:"no-store"}),j=await r.json();if(!r.ok||!j.token)throw Error(j.detail||"Could not obtain Agora token");await c.join(config.agora_app_id,room,j.token,uid);stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
-ws=new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+"/api/browser");ws.onmessage=e=>{try{const d=JSON.parse(e.data);if(d.type==="ready"){log("Krisp ready: "+d.source_language+" → "+d.target_language);if(resolveReady){resolveReady();resolveReady=null}}else if(d.type==="error"){log("["+d.stage+"] "+d.message);status(d.message,true);if(rejectReady){rejectReady(Error(d.message));rejectReady=null}}else if(d.type==="audio")play(d.audio,d.sample_rate||16000);else if(d.type==="transcript"&&d.text)$("original").textContent=d.text;else if(d.type==="translate"&&d.text)$("translated").textContent=d.text}catch(err){log(err.message||err)}};
+ws=new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+"/api/browser");clientSessionStartPerf=performance.now();ws.onmessage=e=>{try{const d=JSON.parse(e.data);if(d.type==="ready"){log("Krisp ready: "+d.source_language+" → "+d.target_language);if(resolveReady){resolveReady();resolveReady=null}}else if(d.type==="error"){log("["+d.stage+"] "+d.message);status(d.message,true);if(rejectReady){rejectReady(Error(d.message));rejectReady=null}}else if(d.type==="audio")play(d.audio,d.sample_rate||16000,d.seq);else if(d.type==="transcript"&&d.text)$("original").textContent=d.text;else if(d.type==="translate"&&d.text)$("translated").textContent=d.text}catch(err){log(err.message||err)}};
 await new Promise((ok,no)=>{ws.onopen=ok;ws.onerror=()=>no(Error("Could not connect to WIGVO voice pipeline"))});const ready=new Promise((ok,no)=>{resolveReady=ok;rejectReady=no;setTimeout(()=>no(Error("Krisp startup timed out")),50000)});ws.send(JSON.stringify({source_language:$("src").value,target_language:$("target").value,voice:$("voice").value}));await ready;
-playCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000,latencyHint:"interactive"});await playCtx.resume();destination=playCtx.createMediaStreamDestination();micCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000,latencyHint:"interactive"});await micCtx.resume();sourceNode=micCtx.createMediaStreamSource(stream);processor=micCtx.createScriptProcessor(256,1,1);silent=micCtx.createGain();silent.gain.value=0;sourceNode.connect(processor);processor.connect(silent);silent.connect(micCtx.destination);processor.onaudioprocess=e=>{if(!micPaused&&ws&&ws.readyState===1)try{const pcm=toPcm(e.inputBuffer.getChannelData(0));recordClientAudio(clientInputStats,pcm.byteLength,e.inputBuffer.length);ws.send(pcm.buffer)}catch(err){}};
+playCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000,latencyHint:"interactive"});await playCtx.resume();playCtxAnchorPerf=performance.now();playCtxAnchorTime=playCtx.currentTime;destination=playCtx.createMediaStreamDestination();micCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000,latencyHint:"interactive"});await micCtx.resume();sourceNode=micCtx.createMediaStreamSource(stream);processor=micCtx.createScriptProcessor(256,1,1);silent=micCtx.createGain();silent.gain.value=0;sourceNode.connect(processor);processor.connect(silent);silent.connect(micCtx.destination);processor.onaudioprocess=e=>{if(!micPaused&&ws&&ws.readyState===1)try{const pcm=toPcm(e.inputBuffer.getChannelData(0));recordClientAudio(clientInputStats,pcm.byteLength,e.inputBuffer.length);ws.send(pcm.buffer)}catch(err){}};
 sendAudioDiagnostics("audio_context");
 track=AgoraRTC.createCustomAudioTrack({mediaStreamTrack:destination.stream.getAudioTracks()[0],encoderConfig:"speech_low_quality"});await c.publish([track]);for(const u of c.remoteUsers||[])await sub(u);running=true;starting=false;$("uid").textContent="UID "+uid;$("stop").disabled=false;updateAudioButtons();status("Live translation connected");log("Joined "+room+"; translated audio only is published to Agora")
 }catch(e){log(e.message||String(e));status(e.message||String(e),true);starting=false;if(ws){try{ws.close()}catch(_){}ws=null}if(c===client){client=null;try{if(c.connectionState!=="DISCONNECTED")await c.leave()}catch(_){}}if(track){try{track.close()}catch(_){}track=null}if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}if(micCtx)try{await micCtx.close()}catch(_){}if(playCtx)try{await playCtx.close()}catch(_){}micCtx=playCtx=null;$("start").disabled=false;$("stop").disabled=true;running=false}}
 $("src").addEventListener("change",()=>{const src=$("src").value;const target=$("target");if(src===target.value)target.value=src==="en-US"?"pt-BR":"en-US"});$("target").addEventListener("change",()=>{if($("src").value===$("target").value){log("Source and target languages must be different.");$("target").value=$("src").value==="en-US"?"pt-BR":"en-US"}});async function boot(){try{const r=await fetch("/api/config",{cache:"no-store"});config=await r.json();if(!config.agora_app_id)log("AGORA_APP_ID is not configured on Render.");if(!config.krisp_configured)log("KRISP_API_KEY must be added to the Render service.");else log("Krisp Voice Translation configured")}catch(e){log("Config error: "+e.message)}}
-$("start").onclick=startCall;$("stop").onclick=stopCall;$("micMute").onclick=()=>{if(!running)return;micMuted=!micMuted;if(stream)stream.getAudioTracks().forEach(t=>t.enabled=!micMuted);updateAudioButtons();status(micMuted?"Microphone muted":"Microphone unmuted")};$("micPause").onclick=()=>{if(!running)return;micPaused=!micPaused;updateAudioButtons();status(micPaused?"Microphone paused":"Microphone resumed")};$("myAudioMute").onclick=()=>{if(!running)return;myAudioMuted=!myAudioMuted;if(destination)destination.stream.getAudioTracks().forEach(t=>t.enabled=!myAudioMuted);if(myAudioMuted){queued.forEach(n=>{try{n.stop()}catch(e){}});queued=[];playAt=playCtx?playCtx.currentTime:0}updateAudioButtons();status(myAudioMuted?"Your translated audio muted for other participants":"Your translated audio unmuted")};$("otherSpeakerMute").onclick=()=>{if(!running)return;setRemoteSpeakerMuted(!otherSpeakerMuted);status(otherSpeakerMuted?"Other speaker muted on this device":"Other speaker unmuted")};window.addEventListener("beforeunload",()=>{if(ws&&ws.readyState===1)try{ws.send(JSON.stringify({type:"stop"}))}catch(e){}});boot();
+$("start").onclick=startCall;$("stop").onclick=stopCall;$("micMute").onclick=()=>{if(!running)return;micMuted=!micMuted;if(stream)stream.getAudioTracks().forEach(t=>t.enabled=!micMuted);updateAudioButtons();status(micMuted?"Microphone muted":"Microphone unmuted")};$("micPause").onclick=()=>{if(!running)return;micPaused=!micPaused;updateAudioButtons();status(micPaused?"Microphone paused":"Microphone resumed")};$("myAudioMute").onclick=()=>{if(!running)return;myAudioMuted=!myAudioMuted;if(destination)destination.stream.getAudioTracks().forEach(t=>t.enabled=!myAudioMuted);if(myAudioMuted){interruptQueuedPlayback("muted");flushPlaybackDiagnostics(true);queued.forEach(n=>{try{n.stop()}catch(e){}});queued=[];playAt=playCtx?playCtx.currentTime:0}updateAudioButtons();status(myAudioMuted?"Your translated audio muted for other participants":"Your translated audio unmuted")};$("otherSpeakerMute").onclick=()=>{if(!running)return;setRemoteSpeakerMuted(!otherSpeakerMuted);status(otherSpeakerMuted?"Other speaker muted on this device":"Other speaker unmuted")};window.addEventListener("beforeunload",()=>{if(ws&&ws.readyState===1)try{ws.send(JSON.stringify({type:"stop"}))}catch(e){}});boot();
 </script></body></html>'''
 
 
