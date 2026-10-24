@@ -194,6 +194,7 @@ async def browser_translation(ws: WebSocket) -> None:
     frame_timeline: list[str] = []
     frame_timeline_batch = 0
     input_send_seq = 0
+    next_upstream_audio_at = 0.0
     output_recv_seq = 0
     transcript_event_seq = 0
     translate_event_seq = 0
@@ -353,7 +354,7 @@ async def browser_translation(ws: WebSocket) -> None:
         )
 
         async def forward_input() -> None:
-            nonlocal input_send_seq
+            nonlocal input_send_seq, next_upstream_audio_at
             while True:
                 msg = await ws.receive()
                 if msg.get("type") == "websocket.disconnect":
@@ -364,6 +365,12 @@ async def browser_translation(ws: WebSocket) -> None:
                     record_frame("input", len(audio), received_at)
                     input_send_seq += 1
                     if len(audio) <= 65536:
+                        # Krisp VT expects input audio paced in real time. Browser audio callbacks
+                        # can arrive in bursts; preserve each PCM frame's duration at the upstream boundary.
+                        frame_duration_s = len(audio) / 32000.0  # 16 kHz * mono * 16-bit PCM
+                        now = time.monotonic()
+                        if next_upstream_audio_at > now:
+                            await asyncio.sleep(next_upstream_audio_at - now)
                         send_started_at = time.monotonic()
                         if metrics["first_krisp_send_started_at"] is None:
                             metrics["first_krisp_send_started_at"] = send_started_at
@@ -372,6 +379,7 @@ async def browser_translation(ws: WebSocket) -> None:
                             await upstream.send(audio)
                         finally:
                             send_completed_at = time.monotonic()
+                            next_upstream_audio_at = max(send_started_at, send_completed_at) + frame_duration_s
                             if metrics["first_krisp_send_completed_at"] is None:
                                 metrics["first_krisp_send_completed_at"] = send_completed_at
                                 mark_timing("first_krisp_send_completed", send_completed_at)
