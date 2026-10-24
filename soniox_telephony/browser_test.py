@@ -11,6 +11,7 @@ import math
 import urllib.error
 import urllib.request
 from typing import Any
+from uuid import uuid4
 
 import websockets
 from fastapi import WebSocket, WebSocketDisconnect
@@ -176,6 +177,12 @@ async def browser_translation(ws: WebSocket) -> None:
         return
     upstream = None
     tasks: list[asyncio.Task[Any]] = []
+    session_tag = uuid4().hex[:8]
+    timing_marks: dict[str, float] = {}
+    frame_timeline: list[str] = []
+    frame_timeline_batch = 0
+    input_send_seq = 0
+    output_recv_seq = 0
     metrics: dict[str, Any] = {
         "started_at": time.monotonic(),
         "input_frames": 0, "input_bytes": 0, "input_frame_min": None, "input_frame_max": None,
@@ -184,7 +191,43 @@ async def browser_translation(ws: WebSocket) -> None:
         "output_frames": 0, "output_bytes": 0, "output_frame_min": None, "output_frame_max": None,
         "output_last_at": None, "output_first_at": None, "output_interval_count": 0,
         "output_interval_sum_ms": 0.0, "output_interval_min_ms": None, "output_interval_max_ms": None,
+        "first_krisp_send_started_at": None, "first_krisp_send_completed_at": None,
+        "first_output_forwarded_at": None, "first_transcript_at": None, "first_translate_at": None,
     }
+
+    def mark_timing(name: str, at: float | None = None) -> None:
+        timing_marks[name] = time.monotonic() if at is None else at
+
+    def elapsed_ms(at: float | None) -> float | None:
+        if at is None:
+            return None
+        return round((at - metrics["started_at"]) * 1000.0, 2)
+
+    def timing_span_ms(start_name: str, end_name: str) -> float | None:
+        start_at = timing_marks.get(start_name)
+        end_at = timing_marks.get(end_name)
+        if start_at is None or end_at is None:
+            return None
+        return round((end_at - start_at) * 1000.0, 2)
+
+    mark_timing("session_opened", metrics["started_at"])
+
+    def flush_frame_timeline() -> None:
+        nonlocal frame_timeline_batch
+        if not frame_timeline:
+            return
+        frame_timeline_batch += 1
+        logger.info(
+            "Krisp browser frame timeline session=%s batch=%d events=%s",
+            session_tag, frame_timeline_batch, "|".join(frame_timeline),
+        )
+        frame_timeline.clear()
+
+    def add_frame_timeline(event: str) -> None:
+        frame_timeline.append(event)
+        # Batch frame-level timestamps to avoid one log line per 16 ms audio frame.
+        if len(frame_timeline) >= 64:
+            flush_frame_timeline()
 
     def record_frame(direction: str, size: int, now: float) -> None:
         prefix = "input" if direction == "input" else "output"
@@ -218,6 +261,7 @@ async def browser_translation(ws: WebSocket) -> None:
 
     try:
         cfg = await ws.receive_json()
+        mark_timing("browser_config_received")
         source = str(cfg.get("source_language") or "en-US")
         target = str(cfg.get("target_language") or ("pt-BR" if source == "en-US" else "en-US"))
         allowed_languages = {"en-US", "pt-BR"}
@@ -233,21 +277,36 @@ async def browser_translation(ws: WebSocket) -> None:
         voice = str(cfg.get("voice") or "female").lower()
         if voice not in {"male", "female"}:
             voice = "female"
+        mark_timing("token_request_started")
         token = await asyncio.to_thread(_create_session_token)
+        mark_timing("token_ready")
+        mark_timing("upstream_connect_started")
         upstream = await websockets.connect(
             KRISP_VT_URL,
             additional_headers={"Authorization": f"Api-Key {token}"},
             ping_interval=20, ping_timeout=20, close_timeout=5, max_size=8 * 1024 * 1024,
         )
+        mark_timing("upstream_connected")
+        mark_timing("upstream_config_send_started")
         await upstream.send(json.dumps({"config": {
             "audio": {"format": "pcm_s16le", "sample_rate": 16000, "channels": 1},
             "source_language": source, "target_language": target, "voice": voice,
             "features": {"background_voice_cancellation": True},
             "transcript": {"interim": True, "final": True, "translate": True},
         }}))
+        mark_timing("upstream_config_sent")
+        mark_timing("upstream_ready_wait_started")
         try:
             hello_raw = await asyncio.wait_for(upstream.recv(), timeout=45)
             hello = json.loads(hello_raw) if isinstance(hello_raw, str) else {}
+            mark_timing("upstream_ready_received")
+            if hello.get("type") == "ready":
+                logger.info(
+                    "Krisp browser upstream ready session=%s request_id=%s tracks_ms=%s",
+                    session_tag,
+                    str(hello.get("request_id") or "")[:100],
+                    json.dumps(hello.get("tracks_ms"))[:300] if hello.get("tracks_ms") is not None else "unavailable",
+                )
         except asyncio.TimeoutError as exc:
             raise RuntimeError("Krisp did not become ready within 45 seconds.") from exc
         if hello.get("type") != "ready":
@@ -258,6 +317,18 @@ async def browser_translation(ws: WebSocket) -> None:
             return
         await ws.send_json({"type": "ready", "provider": "krisp",
                             "source_language": source, "target_language": target, "sample_rate": 16000})
+        mark_timing("browser_ready_sent")
+        logger.info(
+            "Krisp browser stage timings session=%s session_to_config_ms=%s token_request_ms=%s "
+            "connect_ms=%s config_send_ms=%s ready_wait_ms=%s session_to_ready_ms=%s",
+            session_tag,
+            timing_span_ms("session_opened", "browser_config_received"),
+            timing_span_ms("token_request_started", "token_ready"),
+            timing_span_ms("upstream_connect_started", "upstream_connected"),
+            timing_span_ms("upstream_config_send_started", "upstream_config_sent"),
+            timing_span_ms("upstream_ready_wait_started", "upstream_ready_received"),
+            elapsed_ms(timing_marks.get("upstream_ready_received")),
+        )
 
         async def forward_input() -> None:
             while True:
@@ -266,9 +337,26 @@ async def browser_translation(ws: WebSocket) -> None:
                     return
                 if msg.get("bytes"):
                     audio = msg["bytes"]
-                    record_frame("input", len(audio), time.monotonic())
+                    received_at = time.monotonic()
+                    record_frame("input", len(audio), received_at)
+                    input_send_seq += 1
                     if len(audio) <= 65536:
-                        await upstream.send(audio)
+                        send_started_at = time.monotonic()
+                        if metrics["first_krisp_send_started_at"] is None:
+                            metrics["first_krisp_send_started_at"] = send_started_at
+                            mark_timing("first_krisp_send_started", send_started_at)
+                        try:
+                            await upstream.send(audio)
+                        finally:
+                            send_completed_at = time.monotonic()
+                            if metrics["first_krisp_send_completed_at"] is None:
+                                metrics["first_krisp_send_completed_at"] = send_completed_at
+                                mark_timing("first_krisp_send_completed", send_completed_at)
+                            add_frame_timeline(
+                                f"I{input_send_seq}[r={elapsed_ms(received_at)},"
+                                f"s={elapsed_ms(send_started_at)},e={elapsed_ms(send_completed_at)},"
+                                f"wait={round((send_completed_at-send_started_at)*1000.0,3)},b={len(audio)}]"
+                            )
                     else:
                         await ws.send_json({"type": "error", "stage": "audio", "message": "Audio frame exceeded 64 KB."})
                 elif msg.get("text"):
@@ -303,15 +391,38 @@ async def browser_translation(ws: WebSocket) -> None:
         async def forward_output() -> None:
             async for raw in upstream:
                 if isinstance(raw, bytes):
-                    record_frame("output", len(raw), time.monotonic())
+                    output_received_at = time.monotonic()
+                    record_frame("output", len(raw), output_received_at)
+                    output_recv_seq += 1
+                    browser_send_started_at = time.monotonic()
                     await ws.send_json({"type": "audio", "audio": base64.b64encode(raw).decode("ascii"), "sample_rate": 16000})
+                    browser_send_completed_at = time.monotonic()
+                    if metrics["first_output_forwarded_at"] is None:
+                        metrics["first_output_forwarded_at"] = browser_send_completed_at
+                        mark_timing("first_output_forwarded", browser_send_completed_at)
+                    add_frame_timeline(
+                        f"O{output_recv_seq}[r={elapsed_ms(output_received_at)},"
+                        f"s={elapsed_ms(browser_send_started_at)},e={elapsed_ms(browser_send_completed_at)},"
+                        f"relay={round((browser_send_completed_at-browser_send_started_at)*1000.0,3)},b={len(raw)}]"
+                    )
                     continue
                 try:
                     event = json.loads(raw)
                 except json.JSONDecodeError:
                     continue
+                if isinstance(event.get("transcript"), dict) and metrics["first_transcript_at"] is None:
+                    metrics["first_transcript_at"] = time.monotonic()
+                if isinstance(event.get("translate"), dict) and metrics["first_translate_at"] is None:
+                    metrics["first_translate_at"] = time.monotonic()
                 err = event.get("error")
                 if event.get("type") == "error" or err:
+                    logger.warning(
+                        "Krisp browser upstream error session=%s elapsed_ms=%s code=%s status_code=%s request_id=%s",
+                        session_tag, elapsed_ms(time.monotonic()),
+                        str((err or {}).get("code") or event.get("error_code") or "")[:100],
+                        str((err or {}).get("status_code") or "")[:30],
+                        str((err or {}).get("request_id") or event.get("request_id") or "")[:100],
+                    )
                     await ws.send_json({"type": "error", "stage": "krisp",
                         "message": (err or {}).get("message") or event.get("message") or "Krisp returned an error."})
                 if isinstance(event.get("transcript"), dict):
@@ -339,6 +450,7 @@ async def browser_translation(ws: WebSocket) -> None:
             pass
     finally:
         now = time.monotonic()
+        flush_frame_timeline()
         first_input_at = metrics["input_first_at"]
         first_output_at = metrics["output_first_at"]
         first_output_ms = round((first_output_at - metrics["started_at"]) * 1000.0, 2) if first_output_at is not None else None
@@ -356,6 +468,28 @@ async def browser_translation(ws: WebSocket) -> None:
             metrics["output_frames"], metrics["output_bytes"], metrics["output_frame_min"], metrics["output_frame_max"],
             interval_avg("output"), metrics["output_interval_min_ms"], metrics["output_interval_max_ms"],
             first_output_ms, first_output_after_input_ms,
+        )
+        logger.info(
+            "Krisp browser latency summary session=%s duration_ms=%.2f "
+            "first_input_from_session_ms=%s first_krisp_send_start_from_session_ms=%s "
+            "first_krisp_send_done_from_session_ms=%s first_output_from_session_ms=%s "
+            "first_output_from_ready_ms=%s first_output_after_first_krisp_send_ms=%s "
+            "first_output_after_first_send_done_ms=%s first_transcript_from_session_ms=%s "
+            "first_translate_from_session_ms=%s first_translate_after_first_input_ms=%s "
+            "first_output_forwarded_from_session_ms=%s",
+            session_tag, (now - metrics["started_at"]) * 1000.0,
+            elapsed_ms(first_input_at),
+            elapsed_ms(metrics["first_krisp_send_started_at"]),
+            elapsed_ms(metrics["first_krisp_send_completed_at"]),
+            elapsed_ms(first_output_at),
+            timing_span_ms("upstream_ready_received", "first_output_received"),
+            timing_span_ms("first_krisp_send_started", "first_output_received"),
+            timing_span_ms("first_krisp_send_completed", "first_output_received"),
+            elapsed_ms(metrics["first_transcript_at"]),
+            elapsed_ms(metrics["first_translate_at"]),
+            round((metrics["first_translate_at"] - first_input_at) * 1000.0, 2)
+            if metrics["first_translate_at"] is not None and first_input_at is not None else None,
+            elapsed_ms(metrics["first_output_forwarded_at"]),
         )
         for task in tasks:
             if not task.done():
