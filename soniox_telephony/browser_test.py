@@ -313,7 +313,7 @@ async def browser_translation(ws: WebSocket) -> None:
         await upstream.send(json.dumps({"config": {
             "audio": {"format": "pcm_s16le", "sample_rate": 16000, "channels": 1},
             "source_language": source, "target_language": target, "voice": voice,
-            "features": {"background_voice_cancellation": True},
+            "features": {"background_voice_cancellation": False},
             "transcript": {"interim": True, "final": True, "translate": True},
         }}))
         mark_timing("upstream_config_sent")
