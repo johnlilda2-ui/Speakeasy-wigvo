@@ -331,6 +331,7 @@ async def browser_translation(ws: WebSocket) -> None:
         )
 
         async def forward_input() -> None:
+            nonlocal input_send_seq
             while True:
                 msg = await ws.receive()
                 if msg.get("type") == "websocket.disconnect":
@@ -389,11 +390,17 @@ async def browser_translation(ws: WebSocket) -> None:
                         pass
 
         async def forward_output() -> None:
+            nonlocal output_recv_seq
             async for raw in upstream:
                 if isinstance(raw, bytes):
                     output_received_at = time.monotonic()
                     record_frame("output", len(raw), output_received_at)
                     output_recv_seq += 1
+                    if metrics["output_first_at"] == output_received_at:
+                        mark_timing("first_output_received", output_received_at)
+                    add_frame_timeline(
+                        f"O{output_recv_seq}[r={elapsed_ms(output_received_at)},b={len(raw)}]"
+                    )
                     browser_send_started_at = time.monotonic()
                     await ws.send_json({"type": "audio", "audio": base64.b64encode(raw).decode("ascii"), "sample_rate": 16000})
                     browser_send_completed_at = time.monotonic()
@@ -401,9 +408,9 @@ async def browser_translation(ws: WebSocket) -> None:
                         metrics["first_output_forwarded_at"] = browser_send_completed_at
                         mark_timing("first_output_forwarded", browser_send_completed_at)
                     add_frame_timeline(
-                        f"O{output_recv_seq}[r={elapsed_ms(output_received_at)},"
-                        f"s={elapsed_ms(browser_send_started_at)},e={elapsed_ms(browser_send_completed_at)},"
-                        f"relay={round((browser_send_completed_at-browser_send_started_at)*1000.0,3)},b={len(raw)}]"
+                        f"F{output_recv_seq}[s={elapsed_ms(browser_send_started_at)},"
+                        f"e={elapsed_ms(browser_send_completed_at)},"
+                        f"relay={round((browser_send_completed_at-browser_send_started_at)*1000.0,3)}]"
                     )
                     continue
                 try:
