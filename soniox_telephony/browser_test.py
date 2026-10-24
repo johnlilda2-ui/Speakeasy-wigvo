@@ -28,9 +28,9 @@ def _safe_diagnostic_text(value: Any) -> str:
     """Log only bounded transcript text; redact credential-like strings and control characters."""
     if not isinstance(value, str):
         return ""
-    text = re.sub(r"[\\r\\n\\t]+", " ", value)
-    text = re.sub(r"(?i)\\bBearer\\s+[A-Za-z0-9._~+/=-]+", "[redacted]", text)
-    text = re.sub(r"(?i)\\b(api[-_ ]?key|token|secret|password)\\s*[:=]\\s*[^\\s,;]+", r"\\1=[redacted]", text)
+    text = re.sub(r"[\r\n\t]+", " ", value)
+    text = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+", "[redacted]", text)
+    text = re.sub(r"(?i)\b(api[-_ ]?key|token|secret|password)\s*[:=]\s*[^\s,;]+", r"\1=[redacted]", text)
     if KRISP_API_KEY:
         text = text.replace(KRISP_API_KEY, "[redacted]")
     return text[:240]
@@ -418,11 +418,14 @@ async def browser_translation(ws: WebSocket) -> None:
                                         continue
                                     utterance_id = safe_number(diagnostic.get("utterance_id"))
                                     client_ms = safe_number(diagnostic.get("at_ms"))
+                                    detected_ms = safe_number(diagnostic.get("detected_ms"))
                                     duration_ms = safe_number(diagnostic.get("duration_ms"))
                                     rms = safe_number(diagnostic.get("rms"))
                                     fields = [f"session={session_tag}", f"kind={kind}",
                                               f"utterance={int(utterance_id) if utterance_id is not None else 0}",
                                               f"client_ms={client_ms}"]
+                                    if detected_ms is not None:
+                                        fields.append(f"detected_ms={detected_ms}")
                                     if duration_ms is not None:
                                         fields.append(f"duration_ms={duration_ms}")
                                     if rms is not None:
@@ -430,7 +433,7 @@ async def browser_translation(ws: WebSocket) -> None:
                                     logger.info("WIGVO utterance timing %s", " ".join(fields))
                                     add_frame_timeline(
                                         f"U{int(utterance_id) if utterance_id is not None else 0}"
-                                        f"[kind={kind},client_ms={client_ms},duration_ms={duration_ms}]"
+                                        f"[kind={kind},speech_end_ms={client_ms},detected_ms={detected_ms},duration_ms={duration_ms}]"
                                     )
                         elif control.get("type") == "playback_diagnostics":
                             diagnostic_events = control.get("events")
@@ -520,8 +523,8 @@ async def browser_translation(ws: WebSocket) -> None:
                     transcript_text = _safe_diagnostic_text(transcript_item.get("text"))
                     transcript_text_len = len(transcript_text)
                     logger.info(
-                        "WIGVO recognized text session=%s event=%d final=%s text=%s",
-                        session_tag, transcript_event_seq, int(transcript_final), json.dumps(transcript_text, ensure_ascii=True),
+                        "WIGVO recognized text session=%s event=%d at_ms=%s final=%s text=%s",
+                        session_tag, transcript_event_seq, elapsed_ms(upstream_event_at), int(transcript_final), json.dumps(transcript_text, ensure_ascii=True),
                     )
                     transcript_duration = safe_number(transcript_item.get("duration"))
                     add_frame_timeline(
@@ -543,8 +546,8 @@ async def browser_translation(ws: WebSocket) -> None:
                     translate_text = _safe_diagnostic_text(translate_item.get("text"))
                     translate_text_len = len(translate_text)
                     logger.info(
-                        "WIGVO translated text session=%s event=%d final=%s text=%s",
-                        session_tag, translate_event_seq, int(translate_final), json.dumps(translate_text, ensure_ascii=True),
+                        "WIGVO translated text session=%s event=%d at_ms=%s final=%s text=%s",
+                        session_tag, translate_event_seq, elapsed_ms(upstream_event_at), int(translate_final), json.dumps(translate_text, ensure_ascii=True),
                     )
                     add_frame_timeline(
                         f"X{translate_event_seq}[t={elapsed_ms(upstream_event_at)},"
@@ -685,7 +688,7 @@ function sampleUtterance(samples,now){
   utteranceLastVoicePerf=now;utterancePeakRms=Math.max(utterancePeakRms,rms);
  }else if(utteranceActive&&now-utteranceLastVoicePerf>=speechEndSilenceMs){
   const duration=now-utteranceStartPerf;
-  if(duration>=speechMinDurationMs)sendUtteranceDiag({kind:"speech_end",utterance_id:utteranceSeq,at_ms:diagRound(now-clientSessionStartPerf),duration_ms:diagRound(duration),rms:diagRound(utterancePeakRms)});
+  if(duration>=speechMinDurationMs){const speechEndMs=diagRound(utteranceLastVoicePerf-clientSessionStartPerf);sendUtteranceDiag({kind:"speech_end",utterance_id:utteranceSeq,at_ms:speechEndMs,detected_ms:diagRound(now-clientSessionStartPerf),duration_ms:diagRound(duration),rms:diagRound(utterancePeakRms)})}
   utteranceActive=false;utteranceStartPerf=0;utteranceLastVoicePerf=0;utterancePeakRms=0;
  }return rms
 }
