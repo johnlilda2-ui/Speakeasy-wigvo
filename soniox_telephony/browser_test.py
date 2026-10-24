@@ -439,7 +439,7 @@ async def browser_translation(ws: WebSocket) -> None:
                         pass
 
         async def forward_output() -> None:
-            nonlocal output_recv_seq
+            nonlocal output_recv_seq, transcript_event_seq, translate_event_seq
             async for raw in upstream:
                 if isinstance(raw, bytes):
                     output_received_at = time.monotonic()
