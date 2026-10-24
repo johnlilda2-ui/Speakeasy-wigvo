@@ -24,6 +24,18 @@ KRISP_VT_TOKEN_URL = "https://api.developers.krisp.ai/v2/sdk/voice-translation/s
 KRISP_VT_URL = "wss://streaming.krisp.ai/vt"
 
 
+def _safe_diagnostic_text(value: Any) -> str:
+    """Log only bounded transcript text; redact credential-like strings and control characters."""
+    if not isinstance(value, str):
+        return ""
+    text = re.sub(r"[\\r\\n\\t]+", " ", value)
+    text = re.sub(r"(?i)\\bBearer\\s+[A-Za-z0-9._~+/=-]+", "[redacted]", text)
+    text = re.sub(r"(?i)\\b(api[-_ ]?key|token|secret|password)\\s*[:=]\\s*[^\\s,;]+", r"\\1=[redacted]", text)
+    if KRISP_API_KEY:
+        text = text.replace(KRISP_API_KEY, "[redacted]")
+    return text[:240]
+
+
 def _safe_krisp_http_error(exc: urllib.error.HTTPError) -> str:
     """Summarize a Krisp HTTP failure without logging credentials or raw HTML."""
     headers = exc.headers or {}
@@ -395,6 +407,31 @@ async def browser_translation(ws: WebSocket) -> None:
                                     if value is not None:
                                         fields.append(f"{key}={value}")
                                 logger.info("Browser audio diagnostics stage=%s %s", stage, " ".join(fields))
+                        elif control.get("type") == "utterance_diagnostics":
+                            diagnostic_events = control.get("events")
+                            if isinstance(diagnostic_events, list):
+                                for diagnostic in diagnostic_events[:16]:
+                                    if not isinstance(diagnostic, dict):
+                                        continue
+                                    kind = diagnostic.get("kind")
+                                    if kind not in {"speech_start", "speech_end"}:
+                                        continue
+                                    utterance_id = safe_number(diagnostic.get("utterance_id"))
+                                    client_ms = safe_number(diagnostic.get("at_ms"))
+                                    duration_ms = safe_number(diagnostic.get("duration_ms"))
+                                    rms = safe_number(diagnostic.get("rms"))
+                                    fields = [f"session={session_tag}", f"kind={kind}",
+                                              f"utterance={int(utterance_id) if utterance_id is not None else 0}",
+                                              f"client_ms={client_ms}"]
+                                    if duration_ms is not None:
+                                        fields.append(f"duration_ms={duration_ms}")
+                                    if rms is not None:
+                                        fields.append(f"rms={rms}")
+                                    logger.info("WIGVO utterance timing %s", " ".join(fields))
+                                    add_frame_timeline(
+                                        f"U{int(utterance_id) if utterance_id is not None else 0}"
+                                        f"[kind={kind},client_ms={client_ms},duration_ms={duration_ms}]"
+                                    )
                         elif control.get("type") == "playback_diagnostics":
                             diagnostic_events = control.get("events")
                             if isinstance(diagnostic_events, list):
@@ -480,7 +517,12 @@ async def browser_translation(ws: WebSocket) -> None:
                             metrics["first_final_transcript_at"] = upstream_event_at
                     if metrics["first_transcript_at"] is None:
                         metrics["first_transcript_at"] = upstream_event_at
-                    transcript_text_len = len(str(transcript_item.get("text") or ""))
+                    transcript_text = _safe_diagnostic_text(transcript_item.get("text"))
+                    transcript_text_len = len(transcript_text)
+                    logger.info(
+                        "WIGVO recognized text session=%s event=%d final=%s text=%s",
+                        session_tag, transcript_event_seq, int(transcript_final), json.dumps(transcript_text, ensure_ascii=True),
+                    )
                     transcript_duration = safe_number(transcript_item.get("duration"))
                     add_frame_timeline(
                         f"T{transcript_event_seq}[t={elapsed_ms(upstream_event_at)},"
@@ -498,7 +540,12 @@ async def browser_translation(ws: WebSocket) -> None:
                             metrics["first_final_translate_at"] = upstream_event_at
                     if metrics["first_translate_at"] is None:
                         metrics["first_translate_at"] = upstream_event_at
-                    translate_text_len = len(str(translate_item.get("text") or ""))
+                    translate_text = _safe_diagnostic_text(translate_item.get("text"))
+                    translate_text_len = len(translate_text)
+                    logger.info(
+                        "WIGVO translated text session=%s event=%d final=%s text=%s",
+                        session_tag, translate_event_seq, int(translate_final), json.dumps(translate_text, ensure_ascii=True),
+                    )
                     add_frame_timeline(
                         f"X{translate_event_seq}[t={elapsed_ms(upstream_event_at)},"
                         f"final={int(translate_final)},chars={translate_text_len}]"
@@ -627,6 +674,21 @@ BROWSER_HTML_PAGE = r'''<!doctype html><html lang="en"><head>
 let AgoraRTC=null,client=null,track=null,stream=null,micCtx=null,playCtx=null,processor=null,sourceNode=null,silent=null,destination=null,ws=null,config=null,starting=false,running=false,playAt=0,queued=[],micMuted=false,micPaused=false,myAudioMuted=false,otherSpeakerMuted=false,remoteAudioTracks=new Set(),clientSessionStartPerf=0,playCtxAnchorPerf=0,playCtxAnchorTime=0,playbackDiagBuffer=[];
 const makeAudioStats=()=>({frames:0,bytes:0,samples:0,minFrameBytes:null,maxFrameBytes:null,firstAt:null,lastAt:null,intervalCount:0,intervalSum:0,minInterval:null,maxInterval:null});
 let clientInputStats=makeAudioStats(),clientOutputStats=makeAudioStats();
+let utteranceSeq=0,utteranceActive=false,utteranceStartPerf=0,utteranceLastVoicePerf=0,utterancePeakRms=0;
+const speechRmsThreshold=0.012,speechEndSilenceMs=650,speechMinDurationMs=180;
+function sendUtteranceDiag(event){if(!ws||ws.readyState!==1)return;ws.send(JSON.stringify({type:"utterance_diagnostics",events:[event]}))}
+function sampleUtterance(samples,now){
+ let sum=0;for(let i=0;i<samples.length;i++)sum+=samples[i]*samples[i];
+ const rms=Math.sqrt(sum/Math.max(1,samples.length));
+ if(rms>=speechRmsThreshold){
+  if(!utteranceActive){utteranceSeq++;utteranceActive=true;utteranceStartPerf=now;utterancePeakRms=rms;sendUtteranceDiag({kind:"speech_start",utterance_id:utteranceSeq,at_ms:diagRound(now-clientSessionStartPerf),rms:diagRound(rms)})}
+  utteranceLastVoicePerf=now;utterancePeakRms=Math.max(utterancePeakRms,rms);
+ }else if(utteranceActive&&now-utteranceLastVoicePerf>=speechEndSilenceMs){
+  const duration=now-utteranceStartPerf;
+  if(duration>=speechMinDurationMs)sendUtteranceDiag({kind:"speech_end",utterance_id:utteranceSeq,at_ms:diagRound(now-clientSessionStartPerf),duration_ms:diagRound(duration),rms:diagRound(utterancePeakRms)});
+  utteranceActive=false;utteranceStartPerf=0;utteranceLastVoicePerf=0;utterancePeakRms=0;
+ }return rms
+}
 function recordClientAudio(stats,bytes,samples,now=performance.now()){stats.frames++;stats.bytes+=bytes;stats.samples+=samples;stats.minFrameBytes=stats.minFrameBytes===null?bytes:Math.min(stats.minFrameBytes,bytes);stats.maxFrameBytes=stats.maxFrameBytes===null?bytes:Math.max(stats.maxFrameBytes,bytes);if(stats.firstAt===null)stats.firstAt=now;if(stats.lastAt!==null){const gap=Math.max(0,now-stats.lastAt);stats.intervalCount++;stats.intervalSum+=gap;stats.minInterval=stats.minInterval===null?gap:Math.min(stats.minInterval,gap);stats.maxInterval=stats.maxInterval===null?gap:Math.max(stats.maxInterval,gap)}stats.lastAt=now}
 function avgClientInterval(stats){return stats.intervalCount?Math.round(stats.intervalSum/stats.intervalCount*100)/100:null}
 function diagRound(v){return Number.isFinite(v)?Math.round(v*100)/100:null}
@@ -675,7 +737,7 @@ async function startCall(){if(starting||running)return;clientInputStats=makeAudi
 try{await loadAgora();c=AgoraRTC.createClient({mode:"rtc",codec:"vp8"});client=c;const sub=async u=>{if(!u||c!==client||c.connectionState!=="CONNECTED"||!u.hasAudio)return;try{await c.subscribe(u,"audio");if(u.audioTrack){remoteAudioTracks.add(u.audioTrack);u.audioTrack.setVolume(otherSpeakerMuted?0:100);u.audioTrack.play()}}catch(e){log("Remote audio: "+(e.message||e))}};c.on("user-published",async(u,t)=>{if(t==="audio")await sub(u)});const uid=Math.floor(100000+Math.random()*900000),room=channel();const r=await fetch("/api/agora-token?channel="+encodeURIComponent(room)+"&uid="+uid,{cache:"no-store"}),j=await r.json();if(!r.ok||!j.token)throw Error(j.detail||"Could not obtain Agora token");await c.join(config.agora_app_id,room,j.token,uid);stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
 ws=new WebSocket((location.protocol==="https:"?"wss://":"ws://")+location.host+"/api/browser");clientSessionStartPerf=performance.now();ws.onmessage=e=>{try{const d=JSON.parse(e.data);if(d.type==="ready"){log("Krisp ready: "+d.source_language+" → "+d.target_language);if(resolveReady){resolveReady();resolveReady=null}}else if(d.type==="error"){log("["+d.stage+"] "+d.message);status(d.message,true);if(rejectReady){rejectReady(Error(d.message));rejectReady=null}}else if(d.type==="audio")play(d.audio,d.sample_rate||16000,d.seq);else if(d.type==="transcript"&&d.text)$("original").textContent=d.text;else if(d.type==="translate"&&d.text)$("translated").textContent=d.text}catch(err){log(err.message||err)}};
 await new Promise((ok,no)=>{ws.onopen=ok;ws.onerror=()=>no(Error("Could not connect to WIGVO voice pipeline"))});const ready=new Promise((ok,no)=>{resolveReady=ok;rejectReady=no;setTimeout(()=>no(Error("Krisp startup timed out")),50000)});ws.send(JSON.stringify({source_language:$("src").value,target_language:$("target").value,voice:$("voice").value}));await ready;
-playCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000,latencyHint:"interactive"});await playCtx.resume();playCtxAnchorPerf=performance.now();playCtxAnchorTime=playCtx.currentTime;destination=playCtx.createMediaStreamDestination();micCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000,latencyHint:"interactive"});await micCtx.resume();sourceNode=micCtx.createMediaStreamSource(stream);processor=micCtx.createScriptProcessor(256,1,1);silent=micCtx.createGain();silent.gain.value=0;sourceNode.connect(processor);processor.connect(silent);silent.connect(micCtx.destination);processor.onaudioprocess=e=>{if(!micPaused&&ws&&ws.readyState===1)try{const pcm=toPcm(e.inputBuffer.getChannelData(0));recordClientAudio(clientInputStats,pcm.byteLength,e.inputBuffer.length);ws.send(pcm.buffer)}catch(err){}};
+playCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000,latencyHint:"interactive"});await playCtx.resume();playCtxAnchorPerf=performance.now();playCtxAnchorTime=playCtx.currentTime;destination=playCtx.createMediaStreamDestination();micCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000,latencyHint:"interactive"});await micCtx.resume();sourceNode=micCtx.createMediaStreamSource(stream);processor=micCtx.createScriptProcessor(256,1,1);silent=micCtx.createGain();silent.gain.value=0;sourceNode.connect(processor);processor.connect(silent);silent.connect(micCtx.destination);processor.onaudioprocess=e=>{if(!micPaused&&ws&&ws.readyState===1)try{const samples=e.inputBuffer.getChannelData(0),now=performance.now();sampleUtterance(samples,now);const pcm=toPcm(samples);recordClientAudio(clientInputStats,pcm.byteLength,e.inputBuffer.length,now);ws.send(pcm.buffer)}catch(err){}};
 sendAudioDiagnostics("audio_context");
 track=AgoraRTC.createCustomAudioTrack({mediaStreamTrack:destination.stream.getAudioTracks()[0],encoderConfig:"speech_low_quality"});await c.publish([track]);for(const u of c.remoteUsers||[])await sub(u);running=true;starting=false;$("uid").textContent="UID "+uid;$("stop").disabled=false;updateAudioButtons();status("Live translation connected");log("Joined "+room+"; translated audio only is published to Agora")
 }catch(e){log(e.message||String(e));status(e.message||String(e),true);starting=false;if(ws){try{ws.close()}catch(_){}ws=null}if(c===client){client=null;try{if(c.connectionState!=="DISCONNECTED")await c.leave()}catch(_){}}if(track){try{track.close()}catch(_){}track=null}if(stream){stream.getTracks().forEach(t=>t.stop());stream=null}if(micCtx)try{await micCtx.close()}catch(_){}if(playCtx)try{await playCtx.close()}catch(_){}micCtx=playCtx=null;$("start").disabled=false;$("stop").disabled=true;running=false}}
