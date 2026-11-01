@@ -16,8 +16,8 @@ from src.routes.calls import router as calls_router
 from src.routes.health import router as health_router
 from src.routes.inbound_dispatch import router as inbound_dispatch_router
 from src.routes.loadtest import router as loadtest_router
-from src.routes.stream import router as stream_router
 from src.routes.signalwire_webhook import router as signalwire_router
+from src.routes.stream import router as stream_router
 from src.routes.twilio_webhook import router as twilio_router
 
 STATIC_DIR = Path(__file__).parent.parent / "static"
