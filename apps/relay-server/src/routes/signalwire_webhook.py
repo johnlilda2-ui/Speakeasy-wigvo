@@ -106,7 +106,10 @@ async def signalwire_status_callback(call_id: str, request: Request):
     if call is not None:
         if call.telephony_provider != "signalwire":
             raise HTTPException(status_code=404, detail="SignalWire call not found")
-        if call.call_sid and call_sid and not hmac.compare_digest(call.call_sid, call_sid):
+        if call.call_sid and call_sid and not hmac.compare_digest(
+            call.call_sid.encode("utf-8"),
+            call_sid.encode("utf-8"),
+        ):
             raise HTTPException(status_code=403, detail="SignalWire CallSid mismatch")
         if not call.call_sid and call_sid:
             # Capture the provider SID if a status callback races the REST response.
