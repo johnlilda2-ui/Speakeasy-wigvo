@@ -588,14 +588,32 @@ async def start_call(payload: StartCallRequest) -> JSONResponse:
     SESSIONS[session_id] = session
 
     initiator = initiate_signalwire_call if provider == "signalwire" else initiate_twilio_call
+
+    async def start_leg(phone: str, leg_name: str) -> str:
+        sid = await initiator(phone, session_id, leg_name)
+        if not sid:
+            raise RuntimeError(f"{provider} returned an empty call SID for leg {leg_name}")
+        if session.closed:
+            if provider == "signalwire":
+                await asyncio.to_thread(
+                    hangup_signalwire_call,
+                    space_url=SIGNALWIRE_SPACE_URL,
+                    project_id=SIGNALWIRE_PROJECT_ID,
+                    api_token=SIGNALWIRE_API_TOKEN,
+                    call_sid=sid,
+                )
+            else:
+                client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+                await asyncio.to_thread(client.calls(sid).update, status="completed")
+            raise RuntimeError(f"Call session closed while creating leg {leg_name}")
+        session.call_sids[leg_name] = sid
+        return sid
+
     results = await asyncio.gather(
-        initiator(phone_a, session_id, "a"),
-        initiator(phone_b, session_id, "b"),
+        start_leg(phone_a, "a"),
+        start_leg(phone_b, "b"),
         return_exceptions=True,
     )
-    for leg_name, result in zip(("a", "b"), results):
-        if isinstance(result, str) and result:
-            session.call_sids[leg_name] = result
     failures = [result for result in results if isinstance(result, BaseException)]
     if failures:
         await session.close(reason="call_setup_failed")
