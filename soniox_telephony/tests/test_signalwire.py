@@ -276,6 +276,7 @@ def test_phone_call_page_exposes_provider_selector_without_replacing_root_demo()
     assert 'id="provider"' in response.text
     assert 'value="signalwire"' in response.text
     assert '<button id="start" disabled>' in response.text
+    assert 'log.textContent += x+"\\n";' in response.text
     assert "twilioOption.disabled=!cfg.twilio_configured" in response.text
     assert "signalwireOption.disabled=!cfg.signalwire_configured" in response.text
     assert 'provider:document.querySelector("#provider").value' in response.text
