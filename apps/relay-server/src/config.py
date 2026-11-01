@@ -100,9 +100,16 @@ class Settings(BaseSettings):
         if not value:
             return value
         parsed = urlsplit(value)
+        try:
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("signalwire_space_url contains an invalid port") from exc
+        hostname = (parsed.hostname or "").lower()
         if (
             parsed.scheme != "https"
-            or not parsed.hostname
+            or not hostname.endswith(".signalwire.com")
+            or hostname == "signalwire.com"
+            or port is not None
             or parsed.path
             or parsed.query
             or parsed.fragment
