@@ -89,6 +89,36 @@ async def signalwire_webhook(call_id: str, request: Request):
     return Response(content=cxml, media_type="application/xml")
 
 
+@router.post("/status-callback/{call_id}")
+async def signalwire_status_callback(call_id: str, request: Request):
+    """Authenticate provider callbacks and converge terminal states on call cleanup."""
+    form = await validate_signalwire_http_request(request)
+    call_status = str(form.get("CallStatus", "")).strip().lower()
+    stream_event = str(form.get("StreamEvent", "")).strip().lower()
+    call_sid = str(form.get("CallSid", "")).strip()
+
+    call_id_var.set(call_id)
+    logger.info(
+        "SignalWire status callback: call_id=%s status=%s stream_event=%s sid=%s",
+        call_id,
+        call_status,
+        stream_event,
+        call_sid,
+    )
+
+    terminal_statuses = {"completed", "failed", "busy", "no-answer", "canceled"}
+    terminal_stream_events = {"stream-stopped", "stream-error"}
+    if call_status in terminal_statuses or stream_event in terminal_stream_events:
+        reason = (
+            f"signalwire_{call_status}"
+            if call_status in terminal_statuses
+            else f"signalwire_{stream_event.replace('-', '_')}"
+        )
+        await call_manager.cleanup_call(call_id, reason=reason)
+
+    return {"status": "ok"}
+
+
 @router.websocket("/media-stream/{call_id}")
 async def signalwire_media_stream(ws: WebSocket, call_id: str):
     """Run a SignalWire bidirectional stream through the existing WIGVO router."""
