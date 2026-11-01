@@ -1,7 +1,6 @@
 """SignalWire cXML webhook and bidirectional Media Stream endpoints."""
 from __future__ import annotations
 
-import asyncio
 import logging
 import xml.etree.ElementTree as ET
 
@@ -137,7 +136,13 @@ async def signalwire_media_stream(ws: WebSocket, call_id: str):
             prompt_a=call.prompt_a,
             prompt_b=call.prompt_b,
         )
-        call_manager.register_router(call_id, audio_router)
+        if not call_manager.try_register_router(call_id, audio_router):
+            await ws.close(code=4409, reason="SignalWire stream already connected")
+            return
+
+        # Only mark the provider after this socket has claimed the media slot.
+        # This also prevents failed duplicate attempts changing call cleanup behavior.
+        call.telephony_provider = "signalwire"
         await audio_router.start()
 
         listen_task = asyncio.create_task(dual_session.listen_all())
