@@ -6,6 +6,7 @@ SignalWire sends as an Authorization: Bearer header during the WS handshake.
 """
 from __future__ import annotations
 
+import hmac
 import logging
 
 from fastapi import HTTPException, Request, WebSocket
@@ -70,8 +71,6 @@ async def validate_signalwire_websocket(ws: WebSocket) -> bool:
         return False
 
     # compare_digest avoids ordinary string-comparison timing leakage.
-    import hmac
-
     if not hmac.compare_digest(supplied.strip(), expected):
         logger.warning("Rejected SignalWire media WebSocket without valid bearer token")
         await ws.close(code=4403, reason="Invalid SignalWire bearer token")
