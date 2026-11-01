@@ -34,3 +34,23 @@ async def make_provider_call_async(
         )
     # Settings validates this, but keep the dispatch boundary fail-closed.
     raise RuntimeError(f"Unsupported telephony provider: {provider}")
+
+
+async def hangup_provider_call_async(provider: str, call_sid: str) -> None:
+    """Terminate a provider call after a start/end race without crossing providers."""
+    if provider == "twilio":
+        from src.twilio.outbound import get_twilio_client
+        import asyncio
+
+        client = get_twilio_client()
+        await asyncio.to_thread(
+            client.calls(call_sid).update,
+            status="completed",
+        )
+        return
+    if provider == "signalwire":
+        from src.signalwire.outbound import hangup_call_async
+
+        await hangup_call_async(call_sid)
+        return
+    raise RuntimeError(f"Unsupported telephony provider: {provider}")
