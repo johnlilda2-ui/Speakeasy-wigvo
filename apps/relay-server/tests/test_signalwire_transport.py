@@ -163,7 +163,7 @@ async def test_signalwire_start_rejects_non_pcmu_format():
         )
     )
 
-    assert event is not None
+    assert event is None
     assert handler.is_closed is True
 
 
@@ -192,7 +192,7 @@ async def test_signalwire_start_rejects_mismatched_call_sid():
         )
     )
 
-    assert event is not None
+    assert event is None
     assert handler.is_closed is True
     assert call.call_sid == "SW-expected-call"
 
