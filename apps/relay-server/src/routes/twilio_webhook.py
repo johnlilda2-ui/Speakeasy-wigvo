@@ -141,6 +141,18 @@ async def twilio_status_callback(
     call_sid = str(form.get("CallSid", ""))
     call_duration = str(form.get("CallDuration", ""))
 
+    # Calls are registered before dialing so very fast media streams can attach.
+    # The signed status callback may therefore be the first place we learn the
+    # provider SID; capture it before terminal cleanup tries to hang up the call.
+    active_call = call_manager.get_call(call_id)
+    if (
+        active_call is not None
+        and active_call.telephony_provider == "twilio"
+        and not active_call.call_sid
+        and call_sid
+    ):
+        active_call.call_sid = call_sid
+
     call_id_var.set(call_id)
     logger.info(
         "Twilio status callback: call_id=%s, status=%s, stream_event=%s, "
