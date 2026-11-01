@@ -30,6 +30,12 @@ def configure_signalwire(monkeypatch):
     monkeypatch.setattr(settings, "signalwire_space_url", "https://wigvo-test.signalwire.com")
     monkeypatch.setattr(settings, "signalwire_project_id", "00000000-0000-0000-0000-000000000123")
     monkeypatch.setattr(settings, "signalwire_api_token", "private-api-token")
+    monkeypatch.setattr(settings, "signalwire_signing_key", "signalwire-signing-test-key")
+    monkeypatch.setattr(
+        settings,
+        "signalwire_stream_token",
+        "test-signalwire-stream-token-at-least-32-bytes",
+    )
     monkeypatch.setattr(settings, "public_callback_base_url", "https://relay.example.com")
     monkeypatch.setattr(settings, "recipient_answer_timeout_s", 35)
 
@@ -97,6 +103,43 @@ def test_make_call_requires_all_server_credentials(monkeypatch):
             call_id="call-123",
             outbound_number="+12025550100",
         )
+
+
+
+def test_make_call_fails_before_dial_when_stream_bearer_is_missing(monkeypatch):
+    monkeypatch.setattr(settings, "signalwire_stream_token", "")
+    with patch("src.signalwire.outbound.urlopen") as urlopen:
+        with pytest.raises(RuntimeError, match="SIGNALWIRE_STREAM_TOKEN"):
+            outbound.make_call(
+                phone_number="+14155550123",
+                call_id="call-123",
+                outbound_number="+12025550100",
+            )
+    urlopen.assert_not_called()
+
+
+def test_make_call_fails_before_dial_when_webhook_signing_key_is_missing(monkeypatch):
+    monkeypatch.setattr(settings, "signalwire_signing_key", "")
+    with patch("src.signalwire.outbound.urlopen") as urlopen:
+        with pytest.raises(RuntimeError, match="SIGNALWIRE_SIGNING_KEY"):
+            outbound.make_call(
+                phone_number="+14155550123",
+                call_id="call-123",
+                outbound_number="+12025550100",
+            )
+    urlopen.assert_not_called()
+
+
+def test_make_call_requires_public_https_callback_origin(monkeypatch):
+    monkeypatch.setattr(settings, "public_callback_base_url", "http://localhost:8000")
+    with patch("src.signalwire.outbound.urlopen") as urlopen:
+        with pytest.raises(RuntimeError, match="must use HTTPS"):
+            outbound.make_call(
+                phone_number="+14155550123",
+                call_id="call-123",
+                outbound_number="+12025550100",
+            )
+    urlopen.assert_not_called()
 
 
 def test_hangup_call_posts_completed_status_to_the_specific_call_sid():
