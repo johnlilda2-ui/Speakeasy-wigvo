@@ -249,3 +249,21 @@ def test_partial_signalwire_call_setup_hangs_up_created_leg(monkeypatch):
     assert response.status_code == 502
     hangup.assert_called_once()
     assert not soniox_app.SESSIONS
+
+
+def test_signalwire_stream_error_callback_ends_both_call_legs():
+    session = _session()
+    path = f"/signalwire/status/{session.session_id}/a"
+    form = {"CallSid": "SW-call-a", "StreamEvent": "stream-error"}
+    with (
+        patch.object(session, "close", new=AsyncMock()) as close,
+        TestClient(soniox_app.app) as client,
+    ):
+        response = client.post(
+            path,
+            data=form,
+            headers={"X-SignalWire-Signature": _signature(path, form)},
+        )
+    assert response.status_code == 200
+    close.assert_awaited_once_with(reason="signalwire_stream_error")
+    assert session.session_id not in soniox_app.SESSIONS
