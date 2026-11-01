@@ -91,7 +91,7 @@ class PendingCall:
 
 
 class PendingMediaHandler:
-    """Own one Twilio Stream from WAITING_FOR_AGENT through CONNECTED.
+    """Own one provider media stream from WAITING_FOR_AGENT through CONNECTED.
 
     This object is the only WebSocket reader. Handoff swaps the media consumer
     under ``_frame_lock`` so no second receive loop or Stream reconnect exists.
@@ -148,8 +148,8 @@ class PendingMediaHandler:
         try:
             # AI-interpretation disclosure (착신 직후 고지) — played once, then hold.
             for frame in _frames(_notice_audio()):
-                await self.twilio.send_audio(frame)
-                if self.twilio.is_closed:
+                await self.media.send_audio(frame)
+                if self.media.is_closed:
                     return
                 await asyncio.sleep(0.02)
             logger.info(
@@ -160,8 +160,8 @@ class PendingMediaHandler:
             hold = _frames(_hold_audio())
             while True:
                 for frame in hold:
-                    await self.twilio.send_audio(frame)
-                    if self.twilio.is_closed:
+                    await self.media.send_audio(frame)
+                    if self.media.is_closed:
                         return
                     await asyncio.sleep(0.02)
                 await asyncio.sleep(_HOLD_PAUSE_S)
@@ -179,7 +179,7 @@ class PendingMediaHandler:
             self._hold_task = None
 
     async def handle_message(self, raw: str) -> None:
-        event = await self.twilio.handle_message(raw)
+        event = await self.media.handle_message(raw)
         if event is None:
             return
         if event.event == "start" and not self._waiting:
@@ -195,7 +195,7 @@ class PendingMediaHandler:
             self._start_hold()
             return
         if event.event == "media":
-            audio = self.twilio.extract_audio(event)
+            audio = self.media.extract_audio(event)
             if not audio:
                 return
             async with self._frame_lock:
@@ -230,19 +230,28 @@ class PendingMediaHandler:
             self._router = router
 
     async def run(self) -> None:
-        reason = "twilio_disconnected"
+        provider = self.pending.provider
+        reason = f"{provider}_disconnected"
         try:
             while not self._closed:
                 raw = await self.ws.receive_text()
                 await self.handle_message(raw)
-                if self.twilio.is_closed:
-                    reason = "twilio_stopped"
+                if self.media.is_closed:
+                    reason = f"{provider}_stopped"
                     break
         except WebSocketDisconnect:
-            logger.info("Inbound Twilio Stream disconnected (call=%s)", self.call.call_id)
+            logger.info(
+                "Inbound %s Stream disconnected (call=%s)",
+                provider,
+                self.call.call_id,
+            )
         except Exception:
-            reason = "twilio_media_error"
-            logger.exception("Inbound Twilio Stream failed (call=%s)", self.call.call_id)
+            reason = f"{provider}_media_error"
+            logger.exception(
+                "Inbound %s Stream failed (call=%s)",
+                provider,
+                self.call.call_id,
+            )
         finally:
             await cleanup_inbound_media(self.call.call_id, reason)
 
@@ -251,7 +260,7 @@ class PendingMediaHandler:
             return
         self._closed = True
         await self._stop_hold()
-        await self.twilio.close()
+        await self.media.close()
 
 
 class PendingMediaRegistry:
