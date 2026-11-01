@@ -52,6 +52,7 @@ ALLOWED_TRANSITIONS: dict[DispatchState, frozenset[DispatchState]] = {
 class DispatchRecord(BaseModel):
     call_id: UUID
     tenant_id: UUID
+    provider: str = "twilio"
     provider_call_sid: str | None = None
     state: DispatchState
     claimed_by: UUID | None = None
