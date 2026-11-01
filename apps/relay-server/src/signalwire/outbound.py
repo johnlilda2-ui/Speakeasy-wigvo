@@ -81,8 +81,7 @@ def _api_request(path: str, data: dict[str, object]) -> dict[str, object]:
         with urlopen(request, timeout=_HTTP_TIMEOUT_S) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
-        # Do not log credentials or the full request. Provider error body can
-        # contain PII, so expose only a bounded diagnostic.
+        # Do not log the provider response body: it can contain caller data.
         logger.error(
             "SignalWire API request failed: status=%s endpoint=%s",
             exc.code,
@@ -108,7 +107,7 @@ def _validate_e164(number: str, label: str) -> None:
 
 
 def _validate_call_id(call_id: str) -> None:
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", call_id):
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", call_id):
         raise ValueError("call_id must contain only URL-safe identifier characters")
 
 
