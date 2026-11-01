@@ -113,8 +113,9 @@ async def test_outbound_number_is_tenant_scoped(monkeypatch):
 
     assert await resolve_outbound_number(TENANT_A) == "+821011111111"
     assert await resolve_outbound_number(TENANT_B) == "+821022222222"
-    assert conn.queries[0][1] == (TENANT_A,)
-    assert conn.queries[1][1] == (TENANT_B,)
+    assert conn.queries[0][1] == (TENANT_A, "twilio")
+    assert conn.queries[1][1] == (TENANT_B, "twilio")
+    assert all("provider = $2" in query for query, _params in conn.queries)
 
 
 @pytest.mark.asyncio
