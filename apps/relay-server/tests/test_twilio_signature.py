@@ -88,6 +88,37 @@ def test_valid_terminal_status_callback_reaches_single_cleanup_path():
     cleanup.assert_awaited_once_with("call-123", reason="twilio_completed")
 
 
+def test_status_callback_captures_twilio_call_sid_before_cleanup():
+    path = "/twilio/status-callback/call-123"
+    form = {
+        "CallStatus": "completed",
+        "CallSid": "CA-fast-answer",
+        "CallDuration": "1",
+    }
+    from src.types import ActiveCall
+    call = ActiveCall(call_id="call-123", telephony_provider="twilio")
+    with (
+        patch(
+            "src.routes.twilio_webhook.call_manager.get_call",
+            return_value=call,
+        ),
+        patch(
+            "src.routes.twilio_webhook.call_manager.cleanup_call",
+            new_callable=AsyncMock,
+        ) as cleanup,
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            path,
+            data=form,
+            headers={"X-Twilio-Signature": _signature(path, form)},
+        )
+
+    assert response.status_code == 200
+    assert call.call_sid == "CA-fast-answer"
+    cleanup.assert_awaited_once_with("call-123", reason="twilio_completed")
+
+
 def test_valid_stream_stop_callback_reaches_inbound_cleanup_path():
     path = "/twilio/status-callback/call-123"
     form = {
