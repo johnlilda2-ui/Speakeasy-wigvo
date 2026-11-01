@@ -173,6 +173,31 @@ def test_non_ascii_signalwire_stream_token_is_rejected_by_settings():
 
 
 @pytest.mark.asyncio
+async def test_signalwire_start_rejects_mismatched_call_sid():
+    ws = MagicMock()
+    ws.send_json = AsyncMock()
+    ws.close = AsyncMock()
+    call = ActiveCall(call_id="call-123", call_sid="SW-expected-call")
+    handler = SignalWireMediaStreamHandler(ws=ws, call=call)
+
+    event = await handler.handle_message(
+        json.dumps(
+            {
+                "event": "start",
+                "start": {
+                    "streamSid": "SW-stream-123",
+                    "callSid": "SW-unexpected-call",
+                },
+            }
+        )
+    )
+
+    assert event is not None
+    assert handler.is_closed is True
+    assert call.call_sid == "SW-expected-call"
+
+
+@pytest.mark.asyncio
 async def test_signalwire_stop_event_marks_handler_closed():
     ws = MagicMock()
     ws.send_json = AsyncMock()
@@ -337,6 +362,46 @@ def test_missing_signalwire_webhook_signing_key_fails_closed(monkeypatch):
         response = client.post("/signalwire/webhook/call-123")
 
     assert response.status_code == 503
+
+
+def test_signalwire_webhook_rejects_missing_call_sid():
+    path = "/signalwire/webhook/call-123"
+    form = {}
+    call = ActiveCall(
+        call_id="call-123",
+        telephony_provider="signalwire",
+    )
+    with (
+        patch("src.routes.signalwire_webhook.call_manager.get_call", return_value=call),
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            path,
+            data=form,
+            headers={"X-SignalWire-Signature": _http_signature(path, form)},
+        )
+
+    assert response.status_code == 400
+
+
+def test_signalwire_status_callback_rejects_missing_call_sid():
+    path = "/signalwire/status-callback/call-123"
+    form = {"CallStatus": "completed"}
+    with (
+        patch(
+            "src.routes.signalwire_webhook.call_manager.cleanup_call",
+            new_callable=AsyncMock,
+        ) as cleanup,
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            path,
+            data=form,
+            headers={"X-SignalWire-Signature": _http_signature(path, form)},
+        )
+
+    assert response.status_code == 400
+    cleanup.assert_not_awaited()
 
 
 def test_signalwire_status_callback_cleans_up_matching_terminal_call():
