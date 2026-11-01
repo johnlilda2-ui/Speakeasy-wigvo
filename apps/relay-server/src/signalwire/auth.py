@@ -44,7 +44,15 @@ async def validate_signalwire_http_request(request: Request) -> FormData:
 
     form = await request.form()
     signature = request.headers.get("x-signalwire-signature", "")
-    if not signature or not validator.validate(url, form, signature):
+    try:
+        valid_signature = bool(signature) and validator.validate(url, form, signature)
+    except Exception:
+        logger.exception(
+            "SignalWire webhook signature validation failed path=%s",
+            request.url.path,
+        )
+        valid_signature = False
+    if not valid_signature:
         logger.warning("Rejected invalid SignalWire webhook path=%s", request.url.path)
         raise HTTPException(status_code=403, detail="Invalid SignalWire signature")
     return form
@@ -71,8 +79,14 @@ async def validate_signalwire_websocket(ws: WebSocket) -> bool:
         await ws.close(code=4403, reason="Missing SignalWire bearer token")
         return False
 
-    # compare_digest avoids ordinary string-comparison timing leakage.
-    if not hmac.compare_digest(supplied.strip(), expected):
+    # Treat headers as untrusted bytes and compare in constant time.
+    try:
+        supplied_bytes = supplied.strip().encode("ascii")
+        expected_bytes = expected.encode("ascii")
+    except UnicodeEncodeError:
+        supplied_bytes = b""
+        expected_bytes = expected.encode("ascii")
+    if not hmac.compare_digest(supplied_bytes, expected_bytes):
         logger.warning("Rejected SignalWire media WebSocket without valid bearer token")
         await ws.close(code=4403, reason="Invalid SignalWire bearer token")
         return False
