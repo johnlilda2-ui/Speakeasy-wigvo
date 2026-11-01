@@ -90,6 +90,7 @@ async def twilio_incoming(request: Request):
             tenant_id=dispatch.tenant_id,
             languages=dispatch.languages or languages,
             provider_call_sid=provider_call_sid,
+            provider="twilio",
         )
     except DispatchUnavailable:
         logger.warning("Rejected inbound call because waiting queue is full")
