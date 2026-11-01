@@ -19,6 +19,14 @@ from pydantic import BaseModel, Field
 from twilio.rest import Client
 from twilio.request_validator import RequestValidator
 from twilio.twiml.voice_response import VoiceResponse
+
+from signalwire import (
+    build_cxml as build_signalwire_cxml,
+    create_call as create_signalwire_call,
+    hangup_call as hangup_signalwire_call,
+    validate_bearer_header,
+    validate_webhook_signature,
+)
 from agora_token import build_rtc_token_with_uid
 from browser_test import register_browser_route, register_browser_home
 
@@ -40,6 +48,12 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 TWILIO_VALIDATE_SIGNATURE = os.getenv("TWILIO_VALIDATE_SIGNATURE", "false").lower() == "true"
+SIGNALWIRE_SPACE_URL = os.getenv("SIGNALWIRE_SPACE_URL", "").strip()
+SIGNALWIRE_PROJECT_ID = os.getenv("SIGNALWIRE_PROJECT_ID", "").strip()
+SIGNALWIRE_API_TOKEN = os.getenv("SIGNALWIRE_API_TOKEN", "").strip()
+SIGNALWIRE_PHONE_NUMBER = os.getenv("SIGNALWIRE_PHONE_NUMBER", "").strip()
+SIGNALWIRE_SIGNING_KEY = os.getenv("SIGNALWIRE_SIGNING_KEY", "").strip()
+SIGNALWIRE_STREAM_TOKEN = os.getenv("SIGNALWIRE_STREAM_TOKEN", "").strip()
 AGORA_APP_ID = os.getenv("AGORA_APP_ID", "").strip()
 AGORA_APP_CERTIFICATE = os.getenv("AGORA_APP_CERTIFICATE", "").strip()
 AGORA_TOKEN_TTL_S = max(60, min(int(os.getenv("AGORA_TOKEN_TTL_S", "3600")), 86400))
@@ -55,18 +69,34 @@ def public_base_url() -> str:
     return PUBLIC_BASE_URL or os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 
 
-def ensure_configured() -> None:
+def ensure_configured(provider: str = "twilio") -> None:
     missing = []
     if not SONIOX_API_KEY:
         missing.append("SONIOX_API_KEY")
-    if not TWILIO_ACCOUNT_SID:
-        missing.append("TWILIO_ACCOUNT_SID")
-    if not TWILIO_AUTH_TOKEN:
-        missing.append("TWILIO_AUTH_TOKEN")
-    if not TWILIO_PHONE_NUMBER:
-        missing.append("TWILIO_PHONE_NUMBER")
     if not public_base_url():
         missing.append("PUBLIC_BASE_URL")
+    if provider == "signalwire":
+        if not SIGNALWIRE_SPACE_URL:
+            missing.append("SIGNALWIRE_SPACE_URL")
+        if not SIGNALWIRE_PROJECT_ID:
+            missing.append("SIGNALWIRE_PROJECT_ID")
+        if not SIGNALWIRE_API_TOKEN:
+            missing.append("SIGNALWIRE_API_TOKEN")
+        if not SIGNALWIRE_PHONE_NUMBER:
+            missing.append("SIGNALWIRE_PHONE_NUMBER")
+        if not SIGNALWIRE_SIGNING_KEY:
+            missing.append("SIGNALWIRE_SIGNING_KEY")
+        if not SIGNALWIRE_STREAM_TOKEN or len(SIGNALWIRE_STREAM_TOKEN.encode("utf-8")) < 32 or not SIGNALWIRE_STREAM_TOKEN.isascii():
+            missing.append("SIGNALWIRE_STREAM_TOKEN (at least 32 ASCII bytes)")
+        if public_base_url() and not public_base_url().startswith("https://"):
+            missing.append("PUBLIC_BASE_URL (HTTPS required for SignalWire)")
+    else:
+        if not TWILIO_ACCOUNT_SID:
+            missing.append("TWILIO_ACCOUNT_SID")
+        if not TWILIO_AUTH_TOKEN:
+            missing.append("TWILIO_AUTH_TOKEN")
+        if not TWILIO_PHONE_NUMBER:
+            missing.append("TWILIO_PHONE_NUMBER")
     if missing:
         raise RuntimeError("Missing configuration: " + ", ".join(missing))
 
@@ -96,6 +126,7 @@ class StartCallRequest(BaseModel):
     phone_b: str = Field(..., description="Second participant in E.164")
     language_a: str = Field("en", min_length=2, max_length=10)
     language_b: str = Field("pt", min_length=2, max_length=10)
+    provider: str = Field("twilio", min_length=5, max_length=10)
 
 
 class Leg:
@@ -105,7 +136,7 @@ class Leg:
         self.language = language
         self.target_language = target_language
         self.voice = voice
-        self.twilio_ws: WebSocket | None = None
+        self.media_ws: WebSocket | None = None
         self.stream_sid = ""
         self.call_sid = ""
         self.twilio_connected = asyncio.Event()
@@ -121,6 +152,15 @@ class Leg:
         self.pending_tts_text = ""
         self.turn_started_at = 0.0
         self.last_audio_at = 0.0
+
+    @property
+    def twilio_ws(self) -> WebSocket | None:
+        """Legacy alias retained for the unchanged Twilio path."""
+        return self.media_ws
+
+    @twilio_ws.setter
+    def twilio_ws(self, value: WebSocket | None) -> None:
+        self.media_ws = value
 
     async def connect_soniox(self) -> None:
         self.stt_ws = await websockets.connect(
@@ -354,6 +394,7 @@ class CallSession:
     language_b: str
     phone_a: str
     phone_b: str
+    provider: str = "twilio"
     created_at: float = field(default_factory=time.time)
     dashboard_ws: WebSocket | None = None
     legs: dict[str, Leg] = field(default_factory=dict)
@@ -377,9 +418,22 @@ class CallSession:
         self.closed = True
         for leg in self.legs.values():
             await leg.close()
-        if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+        if self.provider == "signalwire":
+            if SIGNALWIRE_SPACE_URL and SIGNALWIRE_PROJECT_ID and SIGNALWIRE_API_TOKEN:
+                for sid in set(self.call_sids.values()):
+                    try:
+                        await asyncio.to_thread(
+                            hangup_signalwire_call,
+                            space_url=SIGNALWIRE_SPACE_URL,
+                            project_id=SIGNALWIRE_PROJECT_ID,
+                            api_token=SIGNALWIRE_API_TOKEN,
+                            call_sid=sid,
+                        )
+                    except Exception:
+                        log.exception("SignalWire hangup failed session=%s", self.session_id)
+        elif TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
             client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-            for sid in self.call_sids.values():
+            for sid in set(self.call_sids.values()):
                 try:
                     await asyncio.to_thread(client.calls(sid).update, status="completed")
                 except Exception:
@@ -391,7 +445,7 @@ SESSIONS: dict[str, CallSession] = {}
 
 
 async def initiate_twilio_call(phone: str, session_id: str, leg: str) -> str:
-    ensure_configured()
+    ensure_configured("twilio")
     client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     base = public_base_url()
     url = f"{base}/twilio/voice/{session_id}/{leg}"
@@ -408,6 +462,46 @@ async def initiate_twilio_call(phone: str, session_id: str, leg: str) -> str:
         timeout=30,
     )
     return str(call.sid)
+
+
+
+
+async def initiate_signalwire_call(phone: str, session_id: str, leg: str) -> str:
+    ensure_configured("signalwire")
+    return await asyncio.to_thread(
+        create_signalwire_call,
+        space_url=SIGNALWIRE_SPACE_URL,
+        project_id=SIGNALWIRE_PROJECT_ID,
+        api_token=SIGNALWIRE_API_TOKEN,
+        phone=phone,
+        from_number=SIGNALWIRE_PHONE_NUMBER,
+        public_base_url=public_base_url(),
+        session_id=session_id,
+        leg=leg,
+        timeout_s=30,
+    )
+
+
+async def validate_signalwire_request(request: Request) -> dict[str, str]:
+    if not SIGNALWIRE_SIGNING_KEY:
+        raise HTTPException(status_code=503, detail="SignalWire webhook signing is not configured")
+    form = await request.form()
+    base = public_base_url().rstrip("/")
+    if not base.startswith("https://"):
+        raise HTTPException(status_code=503, detail="SignalWire callbacks require an HTTPS public URL")
+    url = base + request.url.path
+    query = request.scope.get("query_string", b"").decode("latin-1")
+    if query:
+        url += "?" + query
+    signature = request.headers.get("x-signalwire-signature", "")
+    if not validate_webhook_signature(
+        url=url,
+        form=form,
+        signing_key=SIGNALWIRE_SIGNING_KEY,
+        signature=signature,
+    ):
+        raise HTTPException(status_code=403, detail="Invalid SignalWire signature")
+    return {str(key): str(value) for key, value in form.items()}
 
 
 @app.get("/api/agora-token")
