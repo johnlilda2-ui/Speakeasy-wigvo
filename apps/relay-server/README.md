@@ -2,7 +2,7 @@
 
 [한국어](#한국어)
 
-Bidirectional real-time translation call server based on OpenAI Realtime API + Twilio Media Streams.
+Bidirectional real-time translation call server using OpenAI Realtime with Twilio or SignalWire Compatibility API media streams.
 
 ## Quick Start
 
@@ -31,6 +31,7 @@ src/
 │   ├── calls.py             # POST /relay/calls/start, /end — call start/end API
 │   ├── stream.py            # WS /relay/calls/{id}/stream — App <-> Relay WebSocket
 │   ├── twilio_webhook.py    # POST /twilio/webhook — TwiML, WS /twilio/media-stream
+│   ├── signalwire_webhook.py # cXML webhook, signed callbacks, WS /signalwire/media-stream
 │   └── health.py            # GET /health
 │
 ├── realtime/
@@ -504,7 +505,8 @@ Call sites: App WS disconnect, Twilio disconnect, status-callback, manual end, s
 | `OPENAI_REALTIME_MODEL` | `gpt-realtime` | Realtime model |
 | `SUPABASE_URL` | | Supabase URL |
 | `SUPABASE_SERVICE_KEY` | | Supabase service key |
-| `RELAY_SERVER_URL` | `http://localhost:8000` | Server URL (for Twilio webhooks) |
+| `PUBLIC_CALLBACK_BASE_URL` | | Public HTTPS origin for provider callbacks and WSS |
+| `RELAY_SERVER_URL` | `http://localhost:8000` | Relay server URL |
 | `GUARDRAIL_ENABLED` | `true` | Enable Guardrail |
 | `HEARTBEAT_TIMEOUT_S` | `120` | Heartbeat timeout (seconds) |
 | **STT Model** | | |
@@ -1059,7 +1061,8 @@ tenant마다 provider/번호 한 쌍만 저장하므로 provider를 바꾸면 �
 | `OPENAI_REALTIME_MODEL` | `gpt-realtime` | Realtime 모델 |
 | `SUPABASE_URL` | | Supabase URL |
 | `SUPABASE_SERVICE_KEY` | | Supabase 서비스 키 |
-| `RELAY_SERVER_URL` | `http://localhost:8000` | 서버 URL (Twilio webhook용) |
+| `PUBLIC_CALLBACK_BASE_URL` | | Provider callback과 WSS용 외부 HTTPS origin |
+| `RELAY_SERVER_URL` | `http://localhost:8000` | Relay 서버 URL |
 | `GUARDRAIL_ENABLED` | `true` | Guardrail 활성화 |
 | `HEARTBEAT_TIMEOUT_S` | `120` | Heartbeat 타임아웃 (초) |
 | **STT 모델** | | |
