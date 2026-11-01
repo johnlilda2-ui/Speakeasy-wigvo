@@ -308,3 +308,45 @@ async def test_provider_hangup_dispatcher_rejects_unknown_provider():
 
     with pytest.raises(RuntimeError, match="Unsupported telephony provider"):
         await hangup_provider_call_async("unknown", "call-123")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_signalwire_create_hangs_up_call_created_by_worker(monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    started = asyncio.Event()
+    release_worker = asyncio.Event()
+
+    async def fake_to_thread(_func, **_kwargs):
+        started.set()
+        await release_worker.wait()
+        return "SW-created-during-cancel"
+
+    monkeypatch.setattr(outbound.asyncio, "to_thread", fake_to_thread)
+    from src.db import pg_client
+    monkeypatch.setattr(
+        pg_client,
+        "get_tenant_outbound_number",
+        AsyncMock(return_value="+12025550100"),
+    )
+
+    with patch(
+        "src.signalwire.outbound.hangup_call_async",
+        new=AsyncMock(),
+    ) as hangup:
+        task = asyncio.create_task(
+            outbound.make_call_async(
+                phone_number="+14155550123",
+                call_id="call-123",
+                tenant_id="00000000-0000-0000-0000-000000000001",
+            )
+        )
+        await started.wait()
+        task.cancel()
+        release_worker.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    hangup.assert_awaited_once_with("SW-created-during-cancel")
