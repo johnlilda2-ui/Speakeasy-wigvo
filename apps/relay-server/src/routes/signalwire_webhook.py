@@ -99,6 +99,10 @@ async def signalwire_media_stream(ws: WebSocket, call_id: str):
         await ws.close(code=1011, reason="WIGVO call session is not ready")
         return
 
+    # Mark the provider before cleanup can run; CallManager must not send a
+    # SignalWire call SID to the Twilio REST client.
+    call.telephony_provider = "signalwire"
+
     # Do not let a second provider socket replace the media router of an active call.
     if call_manager.get_router(call_id) is not None:
         await ws.close(code=4409, reason="SignalWire stream already connected")
