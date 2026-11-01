@@ -22,6 +22,11 @@ class Settings(BaseSettings):
     # relay_server_url을 사용하되, 프록시/내부 URL과 다르면 반드시 명시한다.
     public_callback_base_url: str = ""
 
+    # SignalWire Compatibility API: dashboard webhook signing key plus the
+    # application-generated bearer token sent to the media WebSocket.
+    signalwire_signing_key: str = ""
+    signalwire_stream_token: str = ""
+
     # OpenAI
     openai_api_key: str = ""
     openai_realtime_model: str = "gpt-realtime"
@@ -58,6 +63,13 @@ class Settings(BaseSettings):
     inbound_wait_timeout_s: int = 120
     inbound_reconnect_grace_s: float = 15.0
     dispatch_sweep_interval_s: float = 5.0
+
+    @field_validator("signalwire_stream_token")
+    @classmethod
+    def validate_signalwire_stream_token(cls, value: str) -> str:
+        if value and len(value.encode("utf-8")) < 32:
+            raise ValueError("signalwire_stream_token must be at least 32 bytes")
+        return value
 
     @field_validator("pickup_token_ttl_s")
     @classmethod
