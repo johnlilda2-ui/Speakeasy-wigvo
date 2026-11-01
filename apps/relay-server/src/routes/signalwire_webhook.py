@@ -214,6 +214,15 @@ async def signalwire_status_callback(call_id: str, request: Request):
 
     call_id_var.set(call_id)
     call = call_manager.get_call(call_id)
+    pending = await pending_media_registry.get_pending(call_id)
+    if call is None and pending is not None:
+        if pending.provider != "signalwire":
+            raise HTTPException(status_code=404, detail="SignalWire call not found")
+        if not hmac.compare_digest(
+            pending.provider_call_sid.encode("utf-8"),
+            call_sid.encode("utf-8"),
+        ):
+            raise HTTPException(status_code=403, detail="SignalWire CallSid mismatch")
     if call is not None:
         if call.telephony_provider != "signalwire":
             raise HTTPException(status_code=404, detail="SignalWire call not found")
