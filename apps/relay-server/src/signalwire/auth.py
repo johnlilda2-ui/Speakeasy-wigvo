@@ -10,6 +10,7 @@ import hmac
 import logging
 
 from fastapi import HTTPException, Request, WebSocket
+from starlette.datastructures import FormData
 from twilio.request_validator import RequestValidator
 
 from src.config import settings
@@ -18,7 +19,7 @@ from src.twilio.signature import public_http_url
 logger = logging.getLogger(__name__)
 
 
-async def validate_signalwire_http_request(request: Request):
+async def validate_signalwire_http_request(request: Request) -> FormData:
     """Return form data only after validating SignalWire's webhook signature."""
     signing_key = settings.signalwire_signing_key
     if not signing_key:
