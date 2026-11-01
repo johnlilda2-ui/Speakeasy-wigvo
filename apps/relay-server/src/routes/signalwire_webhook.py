@@ -101,7 +101,9 @@ async def signalwire_webhook(call_id: str, request: Request):
         raise HTTPException(status_code=404, detail="SignalWire call not found")
 
     provider_call_sid = str(form.get("CallSid", "")).strip()
-    if call.call_sid and provider_call_sid and not hmac.compare_digest(
+    if not provider_call_sid:
+        raise HTTPException(status_code=400, detail="SignalWire CallSid is required")
+    if call.call_sid and not hmac.compare_digest(
         call.call_sid.encode("utf-8"),
         provider_call_sid.encode("utf-8"),
     ):
@@ -123,13 +125,15 @@ async def signalwire_status_callback(call_id: str, request: Request):
     call_status = str(form.get("CallStatus", "")).strip().lower()
     stream_event = str(form.get("StreamEvent", "")).strip().lower()
     call_sid = str(form.get("CallSid", "")).strip()
+    if not call_sid:
+        raise HTTPException(status_code=400, detail="SignalWire CallSid is required")
 
     call_id_var.set(call_id)
     call = call_manager.get_call(call_id)
     if call is not None:
         if call.telephony_provider != "signalwire":
             raise HTTPException(status_code=404, detail="SignalWire call not found")
-        if call.call_sid and call_sid and not hmac.compare_digest(
+        if call.call_sid and not hmac.compare_digest(
             call.call_sid.encode("utf-8"),
             call_sid.encode("utf-8"),
         ):
