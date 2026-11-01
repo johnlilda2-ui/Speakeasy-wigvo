@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from xml.etree import ElementTree as ET
 
 import pytest
@@ -233,8 +233,8 @@ def test_partial_signalwire_call_setup_hangs_up_created_leg(monkeypatch):
         "initiate_signalwire_call",
         AsyncMock(side_effect=["SW-created-leg", RuntimeError("provider unavailable")]),
     )
-    hangup = AsyncMock()
-    monkeypatch.setattr(soniox_app, "hangup_signalwire_call", lambda **kwargs: hangup(**kwargs))
+    hangup = MagicMock()
+    monkeypatch.setattr(soniox_app, "hangup_signalwire_call", hangup)
     with TestClient(soniox_app.app) as client:
         response = client.post(
             "/api/calls",
@@ -247,5 +247,5 @@ def test_partial_signalwire_call_setup_hangs_up_created_leg(monkeypatch):
             },
         )
     assert response.status_code == 502
-    hangup.assert_awaited_once()
+    hangup.assert_called_once()
     assert not soniox_app.SESSIONS
