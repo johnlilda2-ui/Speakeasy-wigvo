@@ -253,6 +253,45 @@ def test_valid_signalwire_webhook_returns_signed_bidirectional_cxml():
     }
 
 
+def test_signalwire_webhook_rejects_mismatched_provider_call_sid():
+    path = "/signalwire/webhook/call-123"
+    form = {"CallSid": "SW-other-call"}
+    call = ActiveCall(
+        call_id="call-123",
+        call_sid="SW-call-123",
+        telephony_provider="signalwire",
+    )
+    with (
+        patch("src.routes.signalwire_webhook.call_manager.get_call", return_value=call),
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            path,
+            data=form,
+            headers={"X-SignalWire-Signature": _http_signature(path, form)},
+        )
+
+    assert response.status_code == 403
+
+
+def test_signalwire_webhook_captures_call_sid_before_rest_response():
+    path = "/signalwire/webhook/call-123"
+    form = {"CallSid": "SW-call-123"}
+    call = ActiveCall(call_id="call-123", telephony_provider="signalwire")
+    with (
+        patch("src.routes.signalwire_webhook.call_manager.get_call", return_value=call),
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            path,
+            data=form,
+            headers={"X-SignalWire-Signature": _http_signature(path, form)},
+        )
+
+    assert response.status_code == 200
+    assert call.call_sid == "SW-call-123"
+
+
 def test_invalid_signalwire_webhook_signature_is_rejected():
     with TestClient(app) as client:
         response = client.post(
@@ -262,6 +301,34 @@ def test_invalid_signalwire_webhook_signature_is_rejected():
         )
 
     assert response.status_code == 403
+
+
+def test_signalwire_media_route_rejects_calls_owned_by_twilio():
+    from src.routes.signalwire_webhook import signalwire_media_stream
+
+    ws = MagicMock()
+    ws.accept = AsyncMock()
+    ws.close = AsyncMock()
+    call = ActiveCall(call_id="call-123", telephony_provider="twilio")
+
+    with (
+        patch(
+            "src.routes.signalwire_webhook.validate_signalwire_websocket",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "src.routes.signalwire_webhook.call_manager.get_call",
+            return_value=call,
+        ),
+    ):
+        import asyncio
+        asyncio.run(signalwire_media_stream(ws, "call-123"))
+
+    ws.close.assert_awaited_once_with(
+        code=4403,
+        reason="Call belongs to a different PSTN provider",
+    )
+    ws.accept.assert_not_awaited()
 
 
 def test_missing_signalwire_webhook_signing_key_fails_closed(monkeypatch):
