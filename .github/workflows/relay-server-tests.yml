@@ -10,6 +10,7 @@ on:
       - feature/soniox-telephony-core
     paths:
       - "apps/relay-server/**"
+      - "soniox_telephony/**"
       - ".github/workflows/relay-server-tests.yml"
   workflow_dispatch:
 
@@ -49,3 +50,24 @@ jobs:
 
       - name: Run unit and component tests
         run: uv run --locked pytest -q --ignore=tests/integration --ignore=tests/e2e
+
+  soniox-telephony-tests:
+    name: Soniox telephony provider tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Soniox app and test dependencies
+        run: python -m pip install -r soniox_telephony/requirements.txt pytest httpx
+
+      - name: Run Soniox telephony tests
+        env:
+          PYTHONPATH: soniox_telephony
+        run: python -m pytest -q soniox_telephony/tests
