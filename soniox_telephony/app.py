@@ -732,6 +732,148 @@ async def twilio_stream(ws: WebSocket, session_id: str, leg: str) -> None:
             SESSIONS.pop(session_id, None)
 
 
+
+
+@app.api_route("/signalwire/voice/{session_id}/{leg}", methods=["GET", "POST"])
+async def signalwire_voice(session_id: str, leg: str, request: Request) -> Response:
+    session = SESSIONS.get(session_id)
+    if not session or leg not in {"a", "b"} or session.provider != "signalwire":
+        return Response(
+            content='<?xml version="1.0" encoding="UTF-8"?><Response><Reject reason="rejected"/></Response>',
+            media_type="application/xml",
+        )
+    form = await validate_signalwire_request(request)
+    sid = form.get("CallSid", "")
+    current = session.legs[leg]
+    if current.call_sid and sid and current.call_sid != sid:
+        raise HTTPException(status_code=403, detail="SignalWire CallSid mismatch")
+    if sid:
+        current.call_sid = sid
+        session.call_sids[leg] = sid
+
+    base = public_base_url().rstrip("/")
+    if not base.startswith("https://"):
+        raise HTTPException(status_code=503, detail="SignalWire media streams require HTTPS")
+    stream_url = "wss://" + base[len("https://"):] + f"/signalwire/stream/{session_id}/{leg}"
+    status_url = base + f"/signalwire/status/{session_id}/{leg}"
+    try:
+        cxml = build_signalwire_cxml(
+            stream_url=stream_url,
+            bearer_token=SIGNALWIRE_STREAM_TOKEN,
+            status_callback_url=status_url,
+            session_id=session_id,
+            leg=leg,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return Response(content=cxml, media_type="application/xml")
+
+
+@app.post("/signalwire/status/{session_id}/{leg}")
+async def signalwire_status(session_id: str, leg: str, request: Request) -> dict[str, str]:
+    session = SESSIONS.get(session_id)
+    if not session or session.provider != "signalwire" or leg not in session.legs:
+        return {"status": "ok"}
+    form = await validate_signalwire_request(request)
+    sid = form.get("CallSid", "")
+    if not sid:
+        raise HTTPException(status_code=400, detail="SignalWire CallSid is required")
+    current = session.legs[leg]
+    if current.call_sid and current.call_sid != sid:
+        raise HTTPException(status_code=403, detail="SignalWire CallSid mismatch")
+    current.call_sid = sid
+    session.call_sids[leg] = sid
+    status = form.get("CallStatus", "").lower()
+    if status in {"completed", "failed", "busy", "no-answer", "canceled"}:
+        await session.close(reason=f"signalwire_{status}")
+        SESSIONS.pop(session_id, None)
+    return {"status": "ok"}
+
+
+@app.websocket("/signalwire/stream/{session_id}/{leg}")
+async def signalwire_stream(ws: WebSocket, session_id: str, leg: str) -> None:
+    session = SESSIONS.get(session_id)
+    if not session or leg not in {"a", "b"} or session.provider != "signalwire":
+        await ws.close(code=4404, reason="SignalWire call session not found")
+        return
+    if not validate_bearer_header(
+        ws.headers.get("authorization", ""),
+        SIGNALWIRE_STREAM_TOKEN,
+    ):
+        await ws.close(code=4403, reason="Invalid SignalWire bearer token")
+        return
+
+    await ws.accept()
+    current = session.legs[leg]
+    current.media_ws = ws
+    await session.send_event({"type": "leg_connecting", "leg": leg, "provider": "signalwire"})
+    try:
+        await current.connect_soniox()
+        await current.start_stt_reader()
+
+        async for raw in ws.iter_text():
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                await ws.close(code=4400, reason="Malformed SignalWire media event")
+                break
+            if not isinstance(data, dict):
+                await ws.close(code=4400, reason="Malformed SignalWire media event")
+                break
+
+            event = data.get("event")
+            if event == "connected":
+                await session.send_event({"type": "media_connected", "leg": leg, "provider": "signalwire"})
+            elif event == "start":
+                start = data.get("start") or {}
+                if not isinstance(start, dict):
+                    await ws.close(code=4400, reason="Invalid SignalWire start event")
+                    break
+                stream_sid = start.get("streamSid") or data.get("streamSid") or ""
+                call_sid = start.get("callSid") or ""
+                media_format = start.get("mediaFormat")
+                expected_format = {
+                    "encoding": "audio/x-mulaw",
+                    "sampleRate": 8000,
+                    "channels": 1,
+                }
+                if not stream_sid or not call_sid or media_format != expected_format:
+                    await ws.close(code=4403, reason="Invalid SignalWire stream metadata")
+                    break
+                if current.call_sid and current.call_sid != call_sid:
+                    await ws.close(code=4403, reason="SignalWire CallSid mismatch")
+                    break
+                current.stream_sid = stream_sid
+                current.call_sid = call_sid
+                session.call_sids[leg] = call_sid
+                current.twilio_connected.set()
+                await session.send_event({"type": "connected", "leg": leg, "provider": "signalwire"})
+            elif event == "media":
+                media = data.get("media") or {}
+                payload = media.get("payload") if isinstance(media, dict) else None
+                if payload:
+                    try:
+                        audio = base64.b64decode(payload, validate=True)
+                    except (ValueError, TypeError):
+                        await ws.close(code=4400, reason="Invalid SignalWire audio payload")
+                        break
+                    await current.send_audio_to_stt(audio)
+            elif event == "stop":
+                break
+    except WebSocketDisconnect:
+        log.info("SignalWire WS disconnected session=%s leg=%s", session_id, leg)
+    except Exception:
+        log.exception("SignalWire WS error session=%s leg=%s", session_id, leg)
+    finally:
+        try:
+            await current.close()
+        except Exception:
+            pass
+        if not session.closed:
+            await session.close(reason=f"leg_{leg}_disconnected")
+            SESSIONS.pop(session_id, None)
+
+
 @app.websocket("/api/calls/{session_id}/events")
 async def call_events(ws: WebSocket, session_id: str) -> None:
     session = SESSIONS.get(session_id)
