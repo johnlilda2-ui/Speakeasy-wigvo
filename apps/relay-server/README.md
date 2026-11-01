@@ -10,7 +10,7 @@ Bidirectional real-time translation call server using OpenAI Realtime with Twili
 uv sync                              # Install dependencies
 cp .env.example .env                  # Configure environment variables
 uv run uvicorn src.main:app --reload  # Development server
-uv run pytest -v                      # Tests (184 tests)
+uv run pytest -v                      # Run the complete test suite
 ```
 
 ## Directory Structure
@@ -547,7 +547,7 @@ changing `TELEPHONY_PROVIDER` or server credentials.
 
 ## 한국어
 
-OpenAI Realtime API + Twilio Media Streams 기반 양방향 실시간 번역 통화 서버.
+OpenAI Realtime과 Twilio 또는 SignalWire Compatibility API Media Stream 기반 양방향 실시간 번역 통화 서버.
 
 ## Quick Start
 
@@ -576,6 +576,7 @@ src/
 │   ├── calls.py             # POST /relay/calls/start, /end — 통화 시작/종료 API
 │   ├── stream.py            # WS /relay/calls/{id}/stream — App ↔ Relay WebSocket
 │   ├── twilio_webhook.py    # POST /twilio/webhook — TwiML, WS /twilio/media-stream
+│   ├── signalwire_webhook.py # cXML, 서명 callback, WS /signalwire/media-stream
 │   └── health.py            # GET /health
 │
 ├── realtime/
