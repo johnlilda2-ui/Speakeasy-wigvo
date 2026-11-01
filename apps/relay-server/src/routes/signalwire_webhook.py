@@ -134,6 +134,7 @@ async def signalwire_incoming(request: Request):
 
     deterministic_call_id = uuid5(NAMESPACE_URL, f"wigvo:signalwire:{provider_call_sid}")
     dispatch = None
+    pending_prepared = False
     try:
         dispatch = await dispatch_service.create_ringing(
             call_id=deterministic_call_id,
@@ -148,6 +149,7 @@ async def signalwire_incoming(request: Request):
             provider_call_sid=provider_call_sid,
             provider="signalwire",
         )
+        pending_prepared = True
         cxml = _signalwire_cxml(str(dispatch.call_id))
     except DispatchUnavailable:
         return Response(
@@ -157,6 +159,8 @@ async def signalwire_incoming(request: Request):
     except (DispatchError, RuntimeError, ValueError, HTTPException):
         logger.exception("Failed to create SignalWire inbound dispatch")
         if dispatch is not None:
+            if pending_prepared:
+                await pending_media_registry.pop(str(dispatch.call_id))
             try:
                 await dispatch_service.finish(dispatch.call_id, "media_prepare_failed")
             except Exception:
