@@ -1104,3 +1104,9 @@ Configure the tenant's `tenant_call_config.provider` as `signalwire` and set its
 `inbound_number` to the SignalWire DID. Keep the SignalWire signing key and stream
 bearer secret server-side. The inbound endpoint is `POST /signalwire/incoming`;
 Twilio remains on `POST /twilio/incoming`.
+
+To route a purchased SignalWire number into WIGVO, set that number's Voice webhook to
+`https://<public-relay-host>/signalwire/incoming` using HTTP POST. The public origin
+must match `PUBLIC_CALLBACK_BASE_URL` (or the configured relay public origin) used for
+signature validation. Keep `SIGNALWIRE_SIGNING_KEY` and `SIGNALWIRE_STREAM_TOKEN`
+configured on the relay only; do not put either secret in the browser.
