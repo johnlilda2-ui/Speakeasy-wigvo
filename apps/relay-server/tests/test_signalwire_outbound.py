@@ -274,3 +274,37 @@ async def test_non_default_tenant_does_not_fall_back_to_global_signalwire_number
             "00000000-0000-0000-0000-000000000002",
             provider="signalwire",
         )
+
+
+def test_make_call_rejects_unsafe_call_id_before_network_request():
+    with patch("src.signalwire.outbound.urlopen") as urlopen:
+        with pytest.raises(ValueError, match="URL-safe identifier"):
+            outbound.make_call(
+                phone_number="+14155550123",
+                call_id="../other-call",
+                outbound_number="+12025550100",
+            )
+
+    urlopen.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_provider_hangup_dispatcher_uses_signalwire_adapter():
+    from unittest.mock import AsyncMock
+    from src.telephony.outbound import hangup_provider_call_async
+
+    with patch(
+        "src.signalwire.outbound.hangup_call_async",
+        new=AsyncMock(),
+    ) as signalwire_hangup:
+        await hangup_provider_call_async("signalwire", "SW-call-123")
+
+    signalwire_hangup.assert_awaited_once_with("SW-call-123")
+
+
+@pytest.mark.asyncio
+async def test_provider_hangup_dispatcher_rejects_unknown_provider():
+    from src.telephony.outbound import hangup_provider_call_async
+
+    with pytest.raises(RuntimeError, match="Unsupported telephony provider"):
+        await hangup_provider_call_async("unknown", "call-123")
