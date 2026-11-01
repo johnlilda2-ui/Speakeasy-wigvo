@@ -926,6 +926,8 @@ small{color:#9eabca}
 <div><label>Language A</label><input id="la" value="en"></div>
 <div><label>Language B</label><input id="lb" value="pt"></div>
 </div>
+<label for="provider">Telephony provider</label>
+<select id="provider"><option value="twilio">Twilio</option><option value="signalwire">SignalWire</option></select>
 <button id="start">Start translated call</button>
 </div>
 <div class="card">
@@ -943,12 +945,13 @@ document.querySelector("#start").onclick=async()=>{
     phone_a:document.querySelector("#a").value,
     phone_b:document.querySelector("#b").value,
     language_a:document.querySelector("#la").value,
-    language_b:document.querySelector("#lb").value
+    language_b:document.querySelector("#lb").value,
+    provider:document.querySelector("#provider").value
   };
   const r=await fetch("/api/calls",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
   const j=await r.json();
   if(!r.ok){statusEl.textContent="Error"; add(JSON.stringify(j)); return}
-  sid=j.session_id; statusEl.textContent="Calling both participants…"; add("Session "+sid);
+  sid=j.session_id; statusEl.textContent="Calling both participants via "+j.provider+"…"; add("Session "+sid+" provider="+j.provider);
   const proto=location.protocol==="https:"?"wss":"ws";
   const ws=new WebSocket(proto+"://"+location.host+"/api/calls/"+sid+"/events");
   ws.onmessage=e=>{const d=JSON.parse(e.data); add(JSON.stringify(d)); if(d.type==="connected") statusEl.textContent="Participant "+d.leg+" connected"; if(d.type==="call_closed") statusEl.textContent="Call ended"}};
