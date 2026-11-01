@@ -242,7 +242,7 @@ async def signalwire_status_callback(call_id: str, request: Request):
             if call_status in terminal_statuses
             else f"signalwire_{stream_event.replace('-', '_')}"
         )
-        if await pending_media_registry.contains(call_id):
+        if await pending_media_registry.contains(call_id, provider="signalwire"):
             await cleanup_inbound_session(call_id, reason)
         else:
             await call_manager.cleanup_call(call_id, reason=reason)
