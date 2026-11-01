@@ -320,6 +320,10 @@ class PendingMediaRegistry:
             pending = self._calls.get(call_id)
             return pending.handler if pending is not None else None
 
+    async def get_pending(self, call_id: str) -> PendingCall | None:
+        async with self._lock:
+            return self._calls.get(call_id)
+
     async def contains(self, call_id: str, provider: str | None = None) -> bool:
         async with self._lock:
             pending = self._calls.get(call_id)
