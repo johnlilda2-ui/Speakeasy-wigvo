@@ -213,16 +213,24 @@ class CallManager:
                         logger.warning(
                             "Failed to terminate Twilio call %s: %s", call.call_sid, e
                         )
+                elif call.telephony_provider == "signalwire":
+                    try:
+                        from src.signalwire.outbound import hangup_call_async
+
+                        await hangup_call_async(call.call_sid)
+                        logger.info("SignalWire call terminated: %s", call.call_sid)
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to terminate SignalWire call %s: %s",
+                            call.call_sid,
+                            e,
+                        )
                 else:
-                    # Never send a SignalWire call SID to Twilio's REST API.
-                    # The SignalWire REST hangup adapter is added with provider
-                    # call-control wiring; media transport teardown remains safe.
-                    logger.warning(
-                        "No PSTN hangup adapter is registered for provider=%s "
-                        "(call=%s, provider_call_sid=%s)",
+                    logger.error(
+                        "Unknown telephony provider=%s for call=%s; "
+                        "refusing cross-provider hang-up",
                         call.telephony_provider,
                         call_id,
-                        call.call_sid,
                     )
 
             # 0c. Langfuse trace 마감 + flush (키 없으면 no-op)
