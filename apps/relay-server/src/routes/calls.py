@@ -26,7 +26,7 @@ from src.observability import tracer
 from src.prompt.generator_v3 import generate_session_a_prompt, generate_session_b_prompt
 from src.realtime.sessions.session_manager import DualSessionManager
 from src.tools.definitions import get_tools_for_mode
-from src.twilio.outbound import make_call_async
+from src.telephony.outbound import make_provider_call_async
 from src.types import (
     ActiveCall,
     CallEndRequest,
@@ -155,30 +155,11 @@ async def start_call(req: CallStartRequest, request: Request):
     call.session_a_id = dual_session.session_a.session_id
     call.session_b_id = dual_session.session_b.session_id
 
-    # 4. Twilio 발신 (async)
-    if settings.load_test_mode:
-        # 부하테스트: 실제 Twilio 발신 없이 가짜 SID 부여. 미디어 스트림은
-        # 부하 하니스가 /twilio/media-stream WS로 직접 연결해 오디오를 주입한다.
-        call.call_sid = f"loadtest-{req.call_id}"
-    else:
-        try:
-            call_sid = await make_call_async(
-                phone_number=req.phone_number,
-                call_id=req.call_id,
-                tenant_id=tenant_id,
-            )
-            call.call_sid = call_sid
-        except asyncio.CancelledError:
-            await call_manager.cleanup_call(req.call_id, reason="start_cancelled")
-            await capacity_manager.release(req.call_id)
-            raise
-        except Exception as e:
-            logger.error("Failed to make Twilio call: %s", e)
-            await call_manager.cleanup_call(req.call_id, reason="twilio_failed")
-            await capacity_manager.release(req.call_id)
-            raise HTTPException(status_code=502, detail="Failed to initiate phone call")
-
-    # 5. Active call 등록 (active++). 예약을 active로 확정(commit).
+    # 4. Register the call and commit capacity BEFORE asking the PSTN provider
+    # to dial. This closes the fast-answer race where SignalWire can request
+    # cXML and open its media WebSocket before the REST create-call response
+    # returns to this process.
+    call.telephony_provider = settings.telephony_provider
     try:
         call_manager.register_call(req.call_id, call)
         if not await capacity_manager.commit(req.call_id):
@@ -192,6 +173,37 @@ async def start_call(req: CallStartRequest, request: Request):
         await call_manager.cleanup_call(req.call_id, reason="start_failed")
         await capacity_manager.release(req.call_id)
         raise HTTPException(status_code=500, detail="Failed to activate call") from exc
+
+    # 5. Create the PSTN call through the configured provider.
+    if settings.load_test_mode:
+        # No provider REST call in load-test mode; media is injected by the harness.
+        call.call_sid = f"loadtest-{req.call_id}"
+    else:
+        try:
+            call.call_sid = await make_provider_call_async(
+                phone_number=req.phone_number,
+                call_id=req.call_id,
+                tenant_id=tenant_id,
+            )
+        except asyncio.CancelledError:
+            await call_manager.cleanup_call(req.call_id, reason="start_cancelled")
+            await capacity_manager.release(req.call_id)
+            raise
+        except Exception as e:
+            logger.error(
+                "Failed to create %s call: %s",
+                settings.telephony_provider,
+                e,
+            )
+            await call_manager.cleanup_call(
+                req.call_id,
+                reason=f"{settings.telephony_provider}_failed",
+            )
+            await capacity_manager.release(req.call_id)
+            raise HTTPException(
+                status_code=502,
+                detail="Failed to initiate phone call",
+            ) from e
 
     # WebSocket URL 생성
     ws_base = settings.relay_server_url.replace("http", "ws")
