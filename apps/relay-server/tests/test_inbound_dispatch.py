@@ -143,7 +143,7 @@ async def test_create_dispatch_returns_tenant_languages_on_first_insert(monkeypa
     assert result.languages == ["ko", "en"]
     assert "JOIN tenant_call_config c ON c.tenant_id = i.tenant_id" in query
     assert "'[]'::jsonb AS languages" not in query
-    assert captured["params"] == (CALL_ID, TENANT_A, "CA_test")
+    assert captured["params"] == (CALL_ID, TENANT_A, "twilio", "CA_test")
 
 
 @pytest.mark.asyncio
