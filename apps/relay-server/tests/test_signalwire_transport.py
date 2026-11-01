@@ -98,6 +98,7 @@ async def test_signalwire_start_event_reads_nested_stream_sid():
     assert event.event == "start"
     assert handler.stream_sid == "SW-stream-123"
     assert call.stream_sid == "SW-stream-123"
+    assert call.call_sid == "SW-call-123"
     assert handler.is_closed is False
 
 
@@ -242,6 +243,10 @@ def test_valid_signalwire_webhook_returns_signed_bidirectional_cxml():
     assert stream.attrib["authBearerToken"] == STREAM_TOKEN
     assert stream.attrib["codec"] == "PCMU@8000h"
     assert stream.attrib["realtime"] == "true"
+    assert stream.attrib["statusCallback"] == (
+        "https://relay.example.com/signalwire/status-callback/call-123"
+    )
+    assert stream.attrib["statusCallbackMethod"] == "POST"
     assert stream.find("./Parameter").attrib == {
         "name": "call_id",
         "value": "call-123",
