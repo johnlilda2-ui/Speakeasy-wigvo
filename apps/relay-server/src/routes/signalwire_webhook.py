@@ -5,7 +5,13 @@ import asyncio
 import logging
 import xml.etree.ElementTree as ET
 
-from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import Response
 
 from src.call_manager import call_manager
@@ -100,14 +106,14 @@ async def signalwire_media_stream(ws: WebSocket, call_id: str):
         await ws.close(code=1011, reason="WIGVO call session is not ready")
         return
 
-    # Mark the provider before cleanup can run; CallManager must not send a
-    # SignalWire call SID to the Twilio REST client.
-    call.telephony_provider = "signalwire"
-
     # Do not let a second provider socket replace the media router of an active call.
     if call_manager.get_router(call_id) is not None:
         await ws.close(code=4409, reason="SignalWire stream already connected")
         return
+
+    # Mark the provider only after the call passes the duplicate-stream guard.
+    # CallManager must never send a SignalWire SID to the Twilio REST client.
+    call.telephony_provider = "signalwire"
 
     await ws.accept()
     logger.info("SignalWire Media Stream connected (call=%s)", call_id)
