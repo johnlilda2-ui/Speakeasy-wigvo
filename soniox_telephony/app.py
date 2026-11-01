@@ -964,7 +964,7 @@ small{color:#9eabca}
 </div>
 <label for="provider">Telephony provider</label>
 <select id="provider"><option value="twilio">Twilio</option><option value="signalwire">SignalWire</option></select>
-<button id="start">Start translated call</button>
+<button id="start" disabled>Start translated call</button>
 </div>
 <div class="card">
 <strong>Status</strong>
@@ -976,9 +976,14 @@ let sid="";
 const statusEl=document.querySelector("#status"),log=document.querySelector("#log");
 function add(x){log.textContent += x+"\n"; log.scrollTop=log.scrollHeight}
 fetch("/health",{cache:"no-store"}).then(r=>r.json()).then(cfg=>{
-  const option=document.querySelector('#provider option[value="signalwire"]');
-  if(option&&!cfg.signalwire_configured){option.disabled=true;add("SignalWire is not configured on this service yet.");}
-}).catch(()=>{});
+  const twilioOption=document.querySelector('#provider option[value="twilio"]');
+  const signalwireOption=document.querySelector('#provider option[value="signalwire"]');
+  if(twilioOption)twilioOption.disabled=!cfg.twilio_configured;
+  if(signalwireOption)signalwireOption.disabled=!cfg.signalwire_configured;
+  if(!cfg.twilio_configured&&cfg.signalwire_configured)$("provider").value="signalwire";
+  if(cfg.twilio_configured||cfg.signalwire_configured)$("start").disabled=false;
+  else add("No telephony provider is configured on this service. Add Twilio or SignalWire credentials in Render.");
+}).catch(()=>add("Could not verify telephony provider configuration; call start remains disabled."));
 document.querySelector("#start").onclick=async()=>{
   statusEl.textContent="Starting…";
   const body={
