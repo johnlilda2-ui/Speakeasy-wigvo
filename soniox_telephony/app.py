@@ -974,7 +974,7 @@ small{color:#9eabca}
 <script>
 let sid="";
 const statusEl=document.querySelector("#status"),log=document.querySelector("#log");
-function add(x){log.textContent += x+"\n"; log.scrollTop=log.scrollHeight}
+function add(x){log.textContent += x+"\\n"; log.scrollTop=log.scrollHeight}
 fetch("/health",{cache:"no-store"}).then(r=>r.json()).then(cfg=>{
   const twilioOption=document.querySelector('#provider option[value="twilio"]');
   const signalwireOption=document.querySelector('#provider option[value="signalwire"]');
