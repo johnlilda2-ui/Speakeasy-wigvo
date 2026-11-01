@@ -980,8 +980,8 @@ fetch("/health",{cache:"no-store"}).then(r=>r.json()).then(cfg=>{
   const signalwireOption=document.querySelector('#provider option[value="signalwire"]');
   if(twilioOption)twilioOption.disabled=!cfg.twilio_configured;
   if(signalwireOption)signalwireOption.disabled=!cfg.signalwire_configured;
-  if(!cfg.twilio_configured&&cfg.signalwire_configured)$("provider").value="signalwire";
-  if(cfg.twilio_configured||cfg.signalwire_configured)$("start").disabled=false;
+  if(!cfg.twilio_configured&&cfg.signalwire_configured)document.querySelector("#provider").value="signalwire";
+  if(cfg.twilio_configured||cfg.signalwire_configured)document.querySelector("#start").disabled=false;
   else add("No telephony provider is configured on this service. Add Twilio or SignalWire credentials in Render.");
 }).catch(()=>add("Could not verify telephony provider configuration; call start remains disabled."));
 document.querySelector("#start").onclick=async()=>{
