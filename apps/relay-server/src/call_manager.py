@@ -193,16 +193,30 @@ class CallManager:
             # asyncio.to_thread로 비동기화하여 이벤트 루프 블로킹 방지
             # 부하테스트 모드에선 실제 SID가 없으므로 Twilio REST 호출을 건너뛴다.
             if call and call.call_sid and not _settings.load_test_mode:
-                try:
-                    from src.twilio.outbound import get_twilio_client
+                if call.telephony_provider == "twilio":
+                    try:
+                        from src.twilio.outbound import get_twilio_client
 
-                    client = get_twilio_client()
-                    await asyncio.to_thread(
-                        client.calls(call.call_sid).update, status="completed"
+                        client = get_twilio_client()
+                        await asyncio.to_thread(
+                            client.calls(call.call_sid).update, status="completed"
+                        )
+                        logger.info("Twilio call terminated: %s", call.call_sid)
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to terminate Twilio call %s: %s", call.call_sid, e
+                        )
+                else:
+                    # Never send a SignalWire call SID to Twilio's REST API.
+                    # The SignalWire REST hangup adapter is added with provider
+                    # call-control wiring; media transport teardown remains safe.
+                    logger.warning(
+                        "No PSTN hangup adapter is registered for provider=%s "
+                        "(call=%s, provider_call_sid=%s)",
+                        call.telephony_provider,
+                        call_id,
+                        call.call_sid,
                     )
-                    logger.info("Twilio call terminated: %s", call.call_sid)
-                except Exception as e:
-                    logger.warning("Failed to terminate Twilio call %s: %s", call.call_sid, e)
 
             # 0c. Langfuse trace 마감 + flush (키 없으면 no-op)
             if call:
