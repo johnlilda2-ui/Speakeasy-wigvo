@@ -5,6 +5,7 @@ import asyncio
 import base64
 import json
 import logging
+import re
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request, urlopen
@@ -79,12 +80,19 @@ def _api_request(path: str, data: dict[str, object]) -> dict[str, object]:
     return payload
 
 
+def _validate_e164(number: str, label: str) -> None:
+    if not re.fullmatch(r"\+[1-9]\d{1,14}", number):
+        raise ValueError(f"{label} must be in E.164 format")
+
+
 def make_call(
     phone_number: str,
     call_id: str,
     outbound_number: str,
 ) -> str:
     """Create a PSTN call whose cXML attaches WIGVO's bidirectional stream."""
+    _validate_e164(phone_number, "Destination number")
+    _validate_e164(outbound_number, "SignalWire outbound number")
     call_id_path = quote(call_id, safe="")
     webhook_url = public_http_url(f"/signalwire/webhook/{call_id_path}")
     status_callback_url = public_http_url(
