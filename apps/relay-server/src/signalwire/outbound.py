@@ -22,12 +22,18 @@ def _credentials() -> tuple[str, str, str]:
     """Return validated Space URL, Project ID, and API Token."""
     space_url = settings.signalwire_space_url.rstrip("/")
     project_id = settings.signalwire_project_id.strip()
-    api_token = settings.signalwire_api_token
+    api_token = settings.signalwire_api_token.strip()
     if not space_url or not project_id or not api_token:
         raise RuntimeError(
             "SIGNALWIRE_SPACE_URL, SIGNALWIRE_PROJECT_ID, and "
             "SIGNALWIRE_API_TOKEN must be configured"
         )
+    try:
+        UUID(project_id)
+    except ValueError as exc:
+        raise RuntimeError("SIGNALWIRE_PROJECT_ID must be a UUID Project ID") from exc
+    if not space_url.startswith("https://") or not space_url.endswith(".signalwire.com") and ".signalwire.com/" not in space_url:
+        raise RuntimeError("SIGNALWIRE_SPACE_URL must be a trusted HTTPS SignalWire Space")
     return space_url, project_id, api_token
 
 
