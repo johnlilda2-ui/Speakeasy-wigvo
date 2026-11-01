@@ -172,12 +172,39 @@ async def make_call_async(
         tenant_id,
         provider="signalwire",
     )
-    return await asyncio.to_thread(
-        make_call,
-        phone_number=phone_number,
-        call_id=call_id,
-        outbound_number=outbound_number,
+    create_task = asyncio.create_task(
+        asyncio.to_thread(
+            make_call,
+            phone_number=phone_number,
+            call_id=call_id,
+            outbound_number=outbound_number,
+        )
     )
+    try:
+        return await asyncio.shield(create_task)
+    except asyncio.CancelledError:
+        # Cancelling asyncio.to_thread does not stop its worker thread. Wait
+        # for the provider response and release the PSTN leg before propagating
+        # cancellation, otherwise an untracked call can remain active.
+        try:
+            call_sid = await asyncio.shield(create_task)
+        except Exception:
+            logger.exception(
+                "SignalWire call creation failed while start request was cancelled "
+                "(call_id=%s)",
+                call_id,
+            )
+        else:
+            try:
+                await hangup_call_async(call_sid)
+            except Exception:
+                logger.exception(
+                    "Failed to hang up SignalWire call created during cancellation "
+                    "(call_id=%s, call_sid=%s)",
+                    call_id,
+                    call_sid,
+                )
+        raise
 
 
 async def hangup_call_async(call_sid: str) -> None:
