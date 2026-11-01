@@ -250,7 +250,8 @@ async def get_tenant_outbound_number(
                 """
                 UPDATE tenant_call_config
                 SET outbound_number = $2, provider = $3, updated_at = now()
-                WHERE tenant_id = $1::uuid AND outbound_number = ''
+                WHERE tenant_id = $1::uuid
+                  AND (provider <> $3 OR outbound_number = '')
                 RETURNING outbound_number
                 """,
                 UUID(default_tenant),
