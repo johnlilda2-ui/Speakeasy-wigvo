@@ -27,6 +27,7 @@ from src.prompt.generator_v3 import generate_session_a_prompt, generate_session_
 from src.realtime.audio_router import AudioRouter
 from src.realtime.sessions.session_manager import DualSessionManager
 from src.twilio.media_stream import TwilioMediaStreamHandler
+from src.signalwire.media_stream import SignalWireMediaStreamHandler
 from src.types import (
     ActiveCall,
     CallMode,
@@ -85,6 +86,7 @@ class PendingCall:
     tenant_id: UUID
     languages: tuple[str, str]
     provider_call_sid: str
+    provider: str = "twilio"
     handler: "PendingMediaHandler | None" = None
 
 
@@ -101,6 +103,7 @@ class PendingMediaHandler:
         self.call = ActiveCall(
             call_id=str(pending.call_id),
             call_sid=pending.provider_call_sid,
+            telephony_provider=pending.provider,
             tenant_id=pending.tenant_id,
             mode=CallMode.RELAY,
             source_language=_INBOUND_SOURCE_LANG,
@@ -117,7 +120,14 @@ class PendingMediaHandler:
         # (b) 수신자 첫 발화→그리팅 발사, (c) pre-greeting 오디오 게이트를
         # 모두 무력화한다 → handoff 직후 양방향 오디오가 바로 흐른다.
         self.call.first_message_sent = True
-        self.twilio = TwilioMediaStreamHandler(ws=ws, call=self.call)
+        handler_type = (
+            SignalWireMediaStreamHandler
+            if pending.provider == "signalwire"
+            else TwilioMediaStreamHandler
+        )
+        self.media = handler_type(ws=ws, call=self.call)
+        # Compatibility alias: existing inbound callers/tests still use .twilio.
+        self.twilio = self.media
         self._frame_lock = asyncio.Lock()
         self._router: AudioRouter | None = None
         self._hold_task: asyncio.Task[None] | None = None
@@ -256,9 +266,12 @@ class PendingMediaRegistry:
         tenant_id: UUID,
         languages: list[str],
         provider_call_sid: str,
+        provider: str = "twilio",
     ) -> PendingCall:
         if len(languages) < 2 or not languages[0] or not languages[1]:
             raise ValueError("Inbound tenant requires a two-language mapping")
+        if provider not in {"twilio", "signalwire"}:
+            raise ValueError("Unsupported inbound telephony provider")
         key = str(call_id)
         async with self._lock:
             existing = self._calls.get(key)
@@ -266,6 +279,7 @@ class PendingMediaRegistry:
                 if (
                     existing.tenant_id != tenant_id
                     or existing.provider_call_sid != provider_call_sid
+                    or existing.provider != provider
                 ):
                     raise RuntimeError("Inbound call identity changed during retry")
                 return existing
@@ -274,6 +288,7 @@ class PendingMediaRegistry:
                 tenant_id=tenant_id,
                 languages=(languages[0], languages[1]),
                 provider_call_sid=provider_call_sid,
+                provider=provider,
             )
             self._calls[key] = pending
             return pending
@@ -284,7 +299,7 @@ class PendingMediaRegistry:
             if pending is None:
                 return None
             if pending.handler is not None:
-                raise RuntimeError("Inbound call already has a Twilio Stream")
+                raise RuntimeError("Inbound call already has a media stream")
             handler = PendingMediaHandler(ws, pending)
             pending.handler = handler
             return handler
