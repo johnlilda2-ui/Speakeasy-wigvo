@@ -43,6 +43,19 @@ class SignalWireMediaStreamHandler(TwilioMediaStreamHandler):
                 if isinstance(stream_sid, str) and stream_sid:
                     data["streamSid"] = stream_sid
 
+                call_sid = start.get("callSid")
+                if isinstance(call_sid, str) and call_sid:
+                    if self.call.call_sid and self.call.call_sid != call_sid:
+                        logger.error(
+                            "SignalWire call SID mismatch in start event (call=%s)",
+                            self.call.call_id,
+                        )
+                        self._closed = True
+                    elif not self.call.call_sid:
+                        # SignalWire can open the stream before REST create-call
+                        # returns; capture the SID so cleanup can still hang up.
+                        self.call.call_sid = call_sid
+
                 media_format = start.get("mediaFormat")
                 if media_format is not None:
                     valid_media_format = False
