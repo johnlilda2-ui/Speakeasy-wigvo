@@ -12,7 +12,7 @@ from urllib.request import Request, urlopen
 from uuid import UUID
 
 from src.config import settings
-from src.twilio.signature import public_http_url
+from src.twilio.signature import public_http_url, public_websocket_url
 
 logger = logging.getLogger(__name__)
 _HTTP_TIMEOUT_S = 20
@@ -101,6 +101,25 @@ def _api_request(path: str, data: dict[str, object]) -> dict[str, object]:
     return payload
 
 
+def _callback_urls(call_id: str) -> tuple[str, str]:
+    """Validate stream security and resolve public webhook destinations before dialing."""
+    if not settings.signalwire_signing_key:
+        raise RuntimeError("SIGNALWIRE_SIGNING_KEY must be configured before dialing")
+    if not settings.signalwire_stream_token:
+        raise RuntimeError("SIGNALWIRE_STREAM_TOKEN must be configured before dialing")
+
+    webhook_url = public_http_url(f"/signalwire/webhook/{call_id}")
+    status_callback_url = public_http_url(
+        f"/signalwire/status-callback/{call_id}"
+    )
+    stream_url = public_websocket_url(f"/signalwire/media-stream/{call_id}")
+    if not stream_url.startswith("wss://"):
+        raise RuntimeError(
+            "PUBLIC_CALLBACK_BASE_URL must use HTTPS for SignalWire media streams"
+        )
+    return webhook_url, status_callback_url
+
+
 def _validate_e164(number: str, label: str) -> None:
     if not re.fullmatch(r"\+[1-9]\d{1,14}", number):
         raise ValueError(f"{label} must be in E.164 format")
@@ -120,11 +139,7 @@ def make_call(
     _validate_e164(phone_number, "Destination number")
     _validate_e164(outbound_number, "SignalWire outbound number")
     _validate_call_id(call_id)
-    call_id_path = quote(call_id, safe="")
-    webhook_url = public_http_url(f"/signalwire/webhook/{call_id_path}")
-    status_callback_url = public_http_url(
-        f"/signalwire/status-callback/{call_id_path}"
-    )
+    webhook_url, status_callback_url = _callback_urls(call_id)
     payload = _api_request(
         "Calls",
         {
