@@ -146,6 +146,9 @@ async def signalwire_media_stream(ws: WebSocket, call_id: str):
     if call is None:
         await ws.close(code=4404, reason="WIGVO call not found")
         return
+    if call.telephony_provider != "signalwire":
+        await ws.close(code=4403, reason="Call belongs to a different PSTN provider")
+        return
 
     dual_session = call_manager.get_session(call_id)
     if dual_session is None:
