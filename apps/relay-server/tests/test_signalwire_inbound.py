@@ -140,3 +140,87 @@ async def test_provider_specific_stream_attach_cannot_claim_other_provider_call(
         await twilio_handler.close()
     finally:
         await pending_media_registry.pop(str(CALL_ID))
+
+
+def test_signalwire_terminal_callback_cleans_matching_pending_inbound_call():
+    path = f"/signalwire/status-callback/{CALL_ID}"
+    form = {
+        "CallSid": "SW-inbound-123",
+        "CallStatus": "completed",
+        "StreamEvent": "",
+    }
+    pending = PendingCall(
+        call_id=CALL_ID,
+        tenant_id=TENANT_ID,
+        languages=("ko", "en"),
+        provider_call_sid=form["CallSid"],
+        provider="signalwire",
+    )
+    cleanup = AsyncMock()
+    with (
+        patch(
+            "src.routes.signalwire_webhook.pending_media_registry.get_pending",
+            new=AsyncMock(return_value=pending),
+        ),
+        patch(
+            "src.routes.signalwire_webhook.pending_media_registry.contains",
+            new=AsyncMock(return_value=True),
+        ),
+        patch(
+            "src.routes.signalwire_webhook.cleanup_inbound_session",
+            new=cleanup,
+        ),
+        patch(
+            "src.routes.signalwire_webhook.call_manager.get_call",
+            return_value=None,
+        ),
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            path,
+            data=form,
+            headers={"X-SignalWire-Signature": _signature(path, form)},
+        )
+
+    assert response.status_code == 200
+    cleanup.assert_awaited_once_with(str(CALL_ID), "signalwire_completed")
+
+
+def test_signalwire_terminal_callback_rejects_mismatched_pending_call_sid():
+    path = f"/signalwire/status-callback/{CALL_ID}"
+    form = {
+        "CallSid": "SW-someone-elses-call",
+        "CallStatus": "completed",
+        "StreamEvent": "",
+    }
+    pending = PendingCall(
+        call_id=CALL_ID,
+        tenant_id=TENANT_ID,
+        languages=("ko", "en"),
+        provider_call_sid="SW-inbound-123",
+        provider="signalwire",
+    )
+    cleanup = AsyncMock()
+    with (
+        patch(
+            "src.routes.signalwire_webhook.pending_media_registry.get_pending",
+            new=AsyncMock(return_value=pending),
+        ),
+        patch(
+            "src.routes.signalwire_webhook.cleanup_inbound_session",
+            new=cleanup,
+        ),
+        patch(
+            "src.routes.signalwire_webhook.call_manager.get_call",
+            return_value=None,
+        ),
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            path,
+            data=form,
+            headers={"X-SignalWire-Signature": _signature(path, form)},
+        )
+
+    assert response.status_code == 403
+    cleanup.assert_not_awaited()
