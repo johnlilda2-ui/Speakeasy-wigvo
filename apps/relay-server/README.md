@@ -1086,3 +1086,21 @@ tenant마다 provider/번호 한 쌍만 저장하므로 provider를 바꾸면 �
 | `LOCAL_VAD_MIN_SILENCE_FRAMES` | `15` | 최소 무음 프레임 (480ms) |
 | **오디오** | | |
 | `MAX_SPEECH_DURATION_S` | `8.0` | 최대 발화 시간 후 강제 commit (초) |
+
+## Inbound telephony provider setup
+
+Inbound DIDs are resolved against `tenant_call_config.provider`. A tenant's configured
+provider must match the provider that receives the DID; the current tenant configuration
+stores one provider/number pair per tenant.
+
+Before enabling SignalWire inbound calls on an existing database, apply
+`migrations/005_inbound_provider_identity.up.sql` once through the database's
+administrative SQL connection. It adds a provider discriminator to inbound dispatch
+records, backfills existing rows as `twilio`, and changes call-SID uniqueness to
+`(provider, provider_call_sid)`. Existing Twilio dispatch rows therefore retain their
+legacy identity. The matching `005_inbound_provider_identity.down.sql` is the rollback.
+
+Configure the tenant's `tenant_call_config.provider` as `signalwire` and set its
+`inbound_number` to the SignalWire DID. Keep the SignalWire signing key and stream
+bearer secret server-side. The inbound endpoint is `POST /signalwire/incoming`;
+Twilio remains on `POST /twilio/incoming`.
