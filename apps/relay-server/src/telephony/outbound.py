@@ -1,12 +1,10 @@
 """Provider selection boundary for WIGVO outbound calls."""
 from __future__ import annotations
 
-import logging
+import asyncio
 from uuid import UUID
 
 from src.config import settings
-
-logger = logging.getLogger(__name__)
 
 
 async def make_provider_call_async(
@@ -40,7 +38,6 @@ async def hangup_provider_call_async(provider: str, call_sid: str) -> None:
     """Terminate a provider call after a start/end race without crossing providers."""
     if provider == "twilio":
         from src.twilio.outbound import get_twilio_client
-        import asyncio
 
         client = get_twilio_client()
         await asyncio.to_thread(
