@@ -133,15 +133,14 @@ async def signalwire_media_stream(ws: WebSocket, call_id: str):
     # Never let CallManager send a SignalWire SID to Twilio's REST client.
     call.telephony_provider = "signalwire"
 
-    await ws.accept()
-    logger.info("SignalWire Media Stream connected (call=%s)", call_id)
-
     call_id_var.set(call_id)
     call_mode_var.set(call.communication_mode.value)
     tenant_id_var.set(str(call.tenant_id))
 
     reason = "signalwire_disconnected"
     try:
+        await ws.accept()
+        logger.info("SignalWire Media Stream connected (call=%s)", call_id)
         await audio_router.start()
 
         listen_task = asyncio.create_task(dual_session.listen_all())
