@@ -91,6 +91,12 @@ def test_make_call_rejects_non_e164_numbers_before_network_request():
                 call_id="call-123",
                 outbound_number="+12025550100",
             )
+        with pytest.raises(ValueError, match="E.164"):
+            outbound.make_call(
+                phone_number="+١٤١٥٥٥٥٠١٢٣",
+                call_id="call-123",
+                outbound_number="+12025550100",
+            )
 
     urlopen.assert_not_called()
 
@@ -168,6 +174,8 @@ def test_signalwire_settings_reject_unsupported_provider_and_untrusted_host():
         Settings(telephony_provider="another-provider")
     with pytest.raises(ValueError, match="HTTPS origin"):
         Settings(signalwire_space_url="https://attacker.example")
+    with pytest.raises(ValueError, match="E.164"):
+        Settings(signalwire_phone_number="+١٢٠٢٥٥٥٠١٠٠")
 
 
 def test_hangup_call_rejects_mismatched_response_sid():
