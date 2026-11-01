@@ -139,6 +139,33 @@ async def test_signalwire_media_payload_decodes_and_outbound_envelopes_match_pro
 
 
 @pytest.mark.asyncio
+async def test_signalwire_start_rejects_non_pcmu_format():
+    ws = MagicMock()
+    ws.send_json = AsyncMock()
+    ws.close = AsyncMock()
+    handler = SignalWireMediaStreamHandler(ws=ws, call=ActiveCall(call_id="call-123"))
+
+    event = await handler.handle_message(
+        json.dumps(
+            {
+                "event": "start",
+                "start": {
+                    "streamSid": "SW-stream-123",
+                    "mediaFormat": {
+                        "encoding": "audio/x-L16",
+                        "sampleRate": 16000,
+                        "channels": 1,
+                    },
+                },
+            }
+        )
+    )
+
+    assert event is not None
+    assert handler.is_closed is True
+
+
+@pytest.mark.asyncio
 async def test_signalwire_stop_event_marks_handler_closed():
     ws = MagicMock()
     ws.send_json = AsyncMock()
@@ -176,6 +203,7 @@ def test_valid_signalwire_webhook_returns_signed_bidirectional_cxml():
         "wss://relay.example.com/signalwire/media-stream/call-123"
     )
     assert stream.attrib["authBearerToken"] == STREAM_TOKEN
+    assert stream.attrib["codec"] == "PCMU@8000h"
     assert stream.attrib["realtime"] == "true"
     assert stream.find("./Parameter").attrib == {
         "name": "call_id",
