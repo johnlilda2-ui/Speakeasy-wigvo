@@ -15,15 +15,16 @@ def _record(row: asyncpg.Record | None) -> DispatchRecord | None:
     return DispatchRecord.model_validate(dict(row))
 
 
-async def resolve_inbound_tenant(inbound_number: str) -> tuple[UUID, list[str]] | None:
+async def resolve_inbound_tenant(inbound_number: str, provider: str = "twilio") -> tuple[UUID, list[str]] | None:
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """
             SELECT tenant_id, languages
             FROM tenant_call_config
-            WHERE provider = 'twilio' AND inbound_number = $1
+            WHERE provider = $1 AND inbound_number = $2
             """,
+            provider,
             inbound_number,
         )
     if row is None:
@@ -50,6 +51,7 @@ async def create_dispatch(
     call_id: UUID,
     tenant_id: UUID,
     provider_call_sid: str | None,
+    provider: str = "twilio",
 ) -> DispatchRecord:
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -57,9 +59,9 @@ async def create_dispatch(
             """
             WITH inserted AS (
               INSERT INTO inbound_call_dispatch (
-                call_id, tenant_id, provider_call_sid, state
+                call_id, tenant_id, provider, provider_call_sid, state
               )
-              VALUES ($1, $2, $3, 'RINGING')
+              VALUES ($1, $2, $3, $4, 'RINGING')
               ON CONFLICT DO NOTHING
               RETURNING *
             )
@@ -69,6 +71,7 @@ async def create_dispatch(
             """,
             call_id,
             tenant_id,
+            provider,
             provider_call_sid,
         )
         if row is None:
@@ -78,16 +81,17 @@ async def create_dispatch(
                 FROM inbound_call_dispatch d
                 JOIN tenant_call_config c ON c.tenant_id = d.tenant_id
                 WHERE d.call_id = $1
-                   OR ($2::text IS NOT NULL AND d.provider_call_sid = $2)
+                   OR ($3::text IS NOT NULL AND d.provider = $2 AND d.provider_call_sid = $3)
                 """,
                 call_id,
+                provider,
                 provider_call_sid,
             )
     result = _record(row)
     if result is None:
         raise RuntimeError("Failed to create inbound dispatch")
-    if result.tenant_id != tenant_id:
-        raise RuntimeError("Inbound provider call is already bound to another tenant")
+    if result.tenant_id != tenant_id or result.provider != provider:
+        raise RuntimeError("Inbound provider call is already bound to another tenant/provider")
     return result
 
 
