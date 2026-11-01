@@ -762,12 +762,13 @@ async def signalwire_voice(session_id: str, leg: str, request: Request) -> Respo
         )
     form = await validate_signalwire_request(request)
     sid = form.get("CallSid", "")
+    if not sid:
+        raise HTTPException(status_code=400, detail="SignalWire CallSid is required")
     current = session.legs[leg]
-    if current.call_sid and sid and current.call_sid != sid:
+    if current.call_sid and current.call_sid != sid:
         raise HTTPException(status_code=403, detail="SignalWire CallSid mismatch")
-    if sid:
-        current.call_sid = sid
-        session.call_sids[leg] = sid
+    current.call_sid = sid
+    session.call_sids[leg] = sid
 
     base = public_base_url().rstrip("/")
     if not base.startswith("https://"):
@@ -802,8 +803,16 @@ async def signalwire_status(session_id: str, leg: str, request: Request) -> dict
     current.call_sid = sid
     session.call_sids[leg] = sid
     status = form.get("CallStatus", "").lower()
-    if status in {"completed", "failed", "busy", "no-answer", "canceled"}:
-        await session.close(reason=f"signalwire_{status}")
+    stream_event = form.get("StreamEvent", "").lower()
+    terminal_statuses = {"completed", "failed", "busy", "no-answer", "canceled"}
+    terminal_stream_events = {"stream-stopped", "stream-error"}
+    if status in terminal_statuses or stream_event in terminal_stream_events:
+        reason = (
+            f"signalwire_{status}"
+            if status in terminal_statuses
+            else f"signalwire_{stream_event.replace('-', '_')}"
+        )
+        await session.close(reason=reason)
         SESSIONS.pop(session_id, None)
     return {"status": "ok"}
 
