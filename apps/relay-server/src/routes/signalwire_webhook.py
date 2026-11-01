@@ -110,8 +110,27 @@ async def signalwire_media_stream(ws: WebSocket, call_id: str):
         await ws.close(code=4409, reason="SignalWire stream already connected")
         return
 
-    # Mark the provider only after the call passes the duplicate-stream guard.
-    # CallManager must never send a SignalWire SID to the Twilio REST client.
+    handler = SignalWireMediaStreamHandler(ws=ws, call=call)
+
+    async def send_to_app(message: WsMessage) -> None:
+        await call_manager.send_to_app(call_id, message)
+
+    audio_router = AudioRouter(
+        call=call,
+        dual_session=dual_session,
+        # AudioRouter consumes the provider-neutral send/extract interface.
+        twilio_handler=handler,
+        app_ws_send=send_to_app,
+        prompt_a=call.prompt_a,
+        prompt_b=call.prompt_b,
+    )
+    # Claim the router slot before accepting. This synchronous check-and-set
+    # is atomic within the event loop, so only one stream can own this call.
+    if not call_manager.try_register_router(call_id, audio_router):
+        await ws.close(code=4409, reason="SignalWire stream already connected")
+        return
+
+    # Never let CallManager send a SignalWire SID to Twilio's REST client.
     call.telephony_provider = "signalwire"
 
     await ws.accept()
@@ -121,28 +140,8 @@ async def signalwire_media_stream(ws: WebSocket, call_id: str):
     call_mode_var.set(call.communication_mode.value)
     tenant_id_var.set(str(call.tenant_id))
 
-    handler = SignalWireMediaStreamHandler(ws=ws, call=call)
     reason = "signalwire_disconnected"
     try:
-        async def send_to_app(message: WsMessage) -> None:
-            await call_manager.send_to_app(call_id, message)
-
-        audio_router = AudioRouter(
-            call=call,
-            dual_session=dual_session,
-            # AudioRouter consumes the provider-neutral send/extract interface.
-            twilio_handler=handler,
-            app_ws_send=send_to_app,
-            prompt_a=call.prompt_a,
-            prompt_b=call.prompt_b,
-        )
-        if not call_manager.try_register_router(call_id, audio_router):
-            await ws.close(code=4409, reason="SignalWire stream already connected")
-            return
-
-        # Only mark the provider after this socket has claimed the media slot.
-        # This also prevents failed duplicate attempts changing call cleanup behavior.
-        call.telephony_provider = "signalwire"
         await audio_router.start()
 
         listen_task = asyncio.create_task(dual_session.listen_all())
