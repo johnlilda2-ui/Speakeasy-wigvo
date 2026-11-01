@@ -23,7 +23,7 @@ from src.signalwire.auth import (
     validate_signalwire_websocket,
 )
 from src.signalwire.media_stream import SignalWireMediaStreamHandler
-from src.twilio.signature import public_websocket_url
+from src.twilio.signature import public_http_url, public_websocket_url
 from src.types import WsMessage, WsMessageType
 
 router = APIRouter(tags=["signalwire"])
@@ -56,6 +56,16 @@ def _signalwire_cxml(call_id: str) -> str:
             detail="SignalWire media streams require an HTTPS public callback URL",
         )
 
+    try:
+        stream_status_url = public_http_url(
+            f"/signalwire/status-callback/{call_id}"
+        )
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="SignalWire stream status callback URL is not configured",
+        ) from exc
+
     response = ET.Element("Response")
     connect = ET.SubElement(response, "Connect")
     stream = ET.SubElement(
@@ -66,6 +76,8 @@ def _signalwire_cxml(call_id: str) -> str:
             "authBearerToken": bearer_token,
             "codec": "PCMU@8000h",
             "realtime": "true",
+            "statusCallback": stream_status_url,
+            "statusCallbackMethod": "POST",
         },
     )
     ET.SubElement(
