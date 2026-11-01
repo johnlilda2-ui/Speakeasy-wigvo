@@ -118,6 +118,15 @@ def test_hangup_call_posts_completed_status_to_the_specific_call_sid():
     assert form == {"Status": ["completed"]}
 
 
+def test_signalwire_settings_reject_unsupported_provider_and_untrusted_host():
+    from src.config import Settings
+
+    with pytest.raises(ValueError, match="telephony_provider"):
+        Settings(telephony_provider="another-provider")
+    with pytest.raises(ValueError, match="HTTPS origin"):
+        Settings(signalwire_space_url="https://attacker.example")
+
+
 def test_hangup_call_rejects_mismatched_response_sid():
     with patch(
         "src.signalwire.outbound.urlopen",
@@ -169,3 +178,99 @@ async def test_provider_dispatcher_keeps_twilio_as_default(monkeypatch):
 
     assert result == "CA-call-123"
     twilio_call.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_tenant_number_resolution_queries_selected_provider(monkeypatch):
+    from src.db import pg_client
+    from unittest.mock import AsyncMock
+
+    class Connection:
+        fetchval = AsyncMock(return_value="+12025550100")
+
+    class Acquire:
+        async def __aenter__(self):
+            return Connection()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class Pool:
+        def acquire(self):
+            return Acquire()
+
+    monkeypatch.setattr(pg_client, "get_pool", AsyncMock(return_value=Pool()))
+    number = await pg_client.get_tenant_outbound_number(
+        "00000000-0000-0000-0000-000000000001",
+        provider="signalwire",
+    )
+
+    assert number == "+12025550100"
+
+
+@pytest.mark.asyncio
+async def test_default_tenant_signalwire_fallback_replaces_twilio_default(monkeypatch):
+    from src.db import pg_client
+    from unittest.mock import AsyncMock
+
+    class Connection:
+        def __init__(self):
+            self.calls = []
+
+        async def fetchval(self, query, *args):
+            self.calls.append((query, args))
+            return None if len(self.calls) == 1 else "+12025550100"
+
+    connection = Connection()
+
+    class Acquire:
+        async def __aenter__(self):
+            return connection
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class Pool:
+        def acquire(self):
+            return Acquire()
+
+    monkeypatch.setattr(pg_client, "get_pool", AsyncMock(return_value=Pool()))
+    monkeypatch.setattr(settings, "signalwire_phone_number", "+12025550100")
+
+    number = await pg_client.get_tenant_outbound_number(
+        "00000000-0000-0000-0000-000000000001",
+        provider="signalwire",
+    )
+
+    assert number == "+12025550100"
+    assert "provider <> $3 OR outbound_number = ''" in connection.calls[1][0]
+    assert connection.calls[1][1][2] == "signalwire"
+
+
+@pytest.mark.asyncio
+async def test_non_default_tenant_does_not_fall_back_to_global_signalwire_number(monkeypatch):
+    from src.db import pg_client
+    from unittest.mock import AsyncMock
+
+    class Connection:
+        fetchval = AsyncMock(return_value=None)
+
+    class Acquire:
+        async def __aenter__(self):
+            return Connection()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    class Pool:
+        def acquire(self):
+            return Acquire()
+
+    monkeypatch.setattr(pg_client, "get_pool", AsyncMock(return_value=Pool()))
+    monkeypatch.setattr(settings, "signalwire_phone_number", "+12025550100")
+
+    with pytest.raises(LookupError, match="provider signalwire"):
+        await pg_client.get_tenant_outbound_number(
+            "00000000-0000-0000-0000-000000000002",
+            provider="signalwire",
+        )
