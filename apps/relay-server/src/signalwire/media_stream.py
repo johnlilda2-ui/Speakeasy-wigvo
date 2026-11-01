@@ -45,13 +45,19 @@ class SignalWireMediaStreamHandler(TwilioMediaStreamHandler):
 
                 media_format = start.get("mediaFormat")
                 if media_format is not None:
-                    if not isinstance(media_format, dict):
-                        raise ValueError("SignalWire mediaFormat must be an object")
-                    if (
-                        media_format.get("encoding") != "audio/x-mulaw"
-                        or int(media_format.get("sampleRate", 0)) != 8000
-                        or int(media_format.get("channels", 0)) != 1
-                    ):
+                    valid_media_format = False
+                    if isinstance(media_format, dict):
+                        try:
+                            sample_rate = int(media_format.get("sampleRate", 0))
+                            channels = int(media_format.get("channels", 0))
+                            valid_media_format = (
+                                media_format.get("encoding") == "audio/x-mulaw"
+                                and sample_rate == 8000
+                                and channels == 1
+                            )
+                        except (TypeError, ValueError):
+                            valid_media_format = False
+                    if not valid_media_format:
                         logger.error(
                             "Unsupported SignalWire media format (call=%s): %s",
                             self.call.call_id,
