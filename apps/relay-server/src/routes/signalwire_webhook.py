@@ -95,10 +95,21 @@ def _signalwire_cxml(call_id: str) -> str:
 @router.post("/webhook/{call_id}")
 async def signalwire_webhook(call_id: str, request: Request):
     """Return SignalWire cXML only for a correctly signed provider callback."""
-    await validate_signalwire_http_request(request)
+    form = await validate_signalwire_http_request(request)
     call = call_manager.get_call(call_id)
     if call is None or call.telephony_provider != "signalwire":
         raise HTTPException(status_code=404, detail="SignalWire call not found")
+
+    provider_call_sid = str(form.get("CallSid", "")).strip()
+    if call.call_sid and provider_call_sid and not hmac.compare_digest(
+        call.call_sid.encode("utf-8"),
+        provider_call_sid.encode("utf-8"),
+    ):
+        raise HTTPException(status_code=403, detail="SignalWire CallSid mismatch")
+    if not call.call_sid and provider_call_sid:
+        # The webhook may arrive before the create-call REST request returns.
+        call.call_sid = provider_call_sid
+
     cxml = _signalwire_cxml(call_id)
     call_id_var.set(call_id)
     logger.info("SignalWire cXML webhook served for call=%s", call_id)
