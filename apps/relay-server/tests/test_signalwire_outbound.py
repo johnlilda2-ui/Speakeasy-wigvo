@@ -28,7 +28,7 @@ class FakeResponse:
 @pytest.fixture(autouse=True)
 def configure_signalwire(monkeypatch):
     monkeypatch.setattr(settings, "signalwire_space_url", "https://wigvo-test.signalwire.com")
-    monkeypatch.setattr(settings, "signalwire_project_id", "project-test-123")
+    monkeypatch.setattr(settings, "signalwire_project_id", "00000000-0000-0000-0000-000000000123")
     monkeypatch.setattr(settings, "signalwire_api_token", "private-api-token")
     monkeypatch.setattr(settings, "public_callback_base_url", "https://relay.example.com")
     monkeypatch.setattr(settings, "recipient_answer_timeout_s", 35)
@@ -55,7 +55,7 @@ def test_make_call_uses_signalwire_compatibility_api_and_signed_callbacks():
     assert sid == "SW-call-123"
     assert request.full_url == (
         "https://wigvo-test.signalwire.com/api/laml/2010-04-01/"
-        "Accounts/project-test-123/Calls"
+        "Accounts/00000000-0000-0000-0000-000000000123/Calls"
     )
     assert request.get_method() == "POST"
     assert request.get_header("Authorization").startswith("Basic ")
@@ -112,7 +112,7 @@ def test_hangup_call_posts_completed_status_to_the_specific_call_sid():
     request = captured["request"]
     form = parse_qs(request.data.decode("utf-8"))
     assert request.full_url.endswith(
-        "/Accounts/project-test-123/Calls/SW-call-123"
+        "/Accounts/00000000-0000-0000-0000-000000000123/Calls/SW-call-123"
     )
     assert request.get_method() == "POST"
     assert form == {"Status": ["completed"]}
