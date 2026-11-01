@@ -51,6 +51,7 @@ class SignalWireMediaStreamHandler(TwilioMediaStreamHandler):
                             self.call.call_id,
                         )
                         self._closed = True
+                        return None
                     elif not self.call.call_sid:
                         # SignalWire can open the stream before REST create-call
                         # returns; capture the SID so cleanup can still hang up.
@@ -77,6 +78,7 @@ class SignalWireMediaStreamHandler(TwilioMediaStreamHandler):
                             media_format,
                         )
                         self._closed = True
+                        return None
 
             event = TwilioMediaEvent(**data)
         except Exception as exc:
@@ -103,6 +105,7 @@ class SignalWireMediaStreamHandler(TwilioMediaStreamHandler):
                         self.call.call_id,
                     )
                     self._closed = True
+                    return None
                 else:
                     logger.info(
                         "SignalWire media stream started: stream_sid=%s",
