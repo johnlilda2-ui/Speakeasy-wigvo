@@ -34,11 +34,15 @@ def _credentials() -> tuple[str, str, str]:
         raise RuntimeError("SIGNALWIRE_PROJECT_ID must be a UUID Project ID") from exc
     parsed = urlsplit(space_url)
     hostname = (parsed.hostname or "").lower()
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise RuntimeError("SIGNALWIRE_SPACE_URL has an invalid port") from exc
     if (
         parsed.scheme != "https"
         or not hostname.endswith(".signalwire.com")
         or hostname == "signalwire.com"
-        or parsed.port is not None
+        or port is not None
         or parsed.path
         or parsed.query
         or parsed.fragment
@@ -79,12 +83,10 @@ def _api_request(path: str, data: dict[str, object]) -> dict[str, object]:
     except HTTPError as exc:
         # Do not log credentials or the full request. Provider error body can
         # contain PII, so expose only a bounded diagnostic.
-        detail = exc.read(2048).decode("utf-8", errors="replace")
         logger.error(
-            "SignalWire API request failed: status=%s endpoint=%s response=%s",
+            "SignalWire API request failed: status=%s endpoint=%s",
             exc.code,
             path,
-            detail[:500],
         )
         raise RuntimeError(
             f"SignalWire API rejected the request (HTTP {exc.code})"
@@ -105,6 +107,11 @@ def _validate_e164(number: str, label: str) -> None:
         raise ValueError(f"{label} must be in E.164 format")
 
 
+def _validate_call_id(call_id: str) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", call_id):
+        raise ValueError("call_id must contain only URL-safe identifier characters")
+
+
 def make_call(
     phone_number: str,
     call_id: str,
@@ -113,6 +120,7 @@ def make_call(
     """Create a PSTN call whose cXML attaches WIGVO's bidirectional stream."""
     _validate_e164(phone_number, "Destination number")
     _validate_e164(outbound_number, "SignalWire outbound number")
+    _validate_call_id(call_id)
     call_id_path = quote(call_id, safe="")
     webhook_url = public_http_url(f"/signalwire/webhook/{call_id_path}")
     status_callback_url = public_http_url(
