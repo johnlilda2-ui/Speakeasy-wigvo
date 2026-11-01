@@ -80,6 +80,19 @@ class Settings(BaseSettings):
             raise ValueError("telephony_provider must be 'twilio' or 'signalwire'")
         return provider
 
+    @field_validator("signalwire_phone_number")
+    @classmethod
+    def validate_signalwire_phone_number(cls, value: str) -> str:
+        value = value.strip()
+        if value and (
+            not value.startswith("+")
+            or not value[1:].isdigit()
+            or not 1 <= len(value[1:]) <= 14
+            or value[1] == "0"
+        ):
+            raise ValueError("signalwire_phone_number must be in E.164 format")
+        return value
+
     @field_validator("signalwire_space_url")
     @classmethod
     def validate_signalwire_space_url(cls, value: str) -> str:
