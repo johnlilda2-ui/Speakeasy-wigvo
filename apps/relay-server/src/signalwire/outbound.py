@@ -29,7 +29,7 @@ def _credentials() -> tuple[str, str, str]:
             "SIGNALWIRE_API_TOKEN must be configured"
         )
     try:
-        UUID(project_id)
+        project_id = str(UUID(project_id))
     except ValueError as exc:
         raise RuntimeError("SIGNALWIRE_PROJECT_ID must be a UUID Project ID") from exc
     parsed = urlsplit(space_url)
@@ -121,7 +121,7 @@ def _callback_urls(call_id: str) -> tuple[str, str]:
 
 
 def _validate_e164(number: str, label: str) -> None:
-    if not re.fullmatch(r"\+[1-9]\d{1,14}", number):
+    if not re.fullmatch(r"\+[1-9][0-9]{1,14}", number):
         raise ValueError(f"{label} must be in E.164 format")
 
 
