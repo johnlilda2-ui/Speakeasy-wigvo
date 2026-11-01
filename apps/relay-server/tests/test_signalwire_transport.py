@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import base64
 import json
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -217,7 +217,15 @@ def _http_signature(path: str, form: dict[str, str]) -> str:
 def test_valid_signalwire_webhook_returns_signed_bidirectional_cxml():
     path = "/signalwire/webhook/call-123"
     form = {"CallSid": "SW-call-123"}
-    with TestClient(app) as client:
+    call = ActiveCall(
+        call_id="call-123",
+        call_sid="SW-call-123",
+        telephony_provider="signalwire",
+    )
+    with (
+        patch("src.routes.signalwire_webhook.call_manager.get_call", return_value=call),
+        TestClient(app) as client,
+    ):
         response = client.post(
             path,
             data=form,
@@ -257,6 +265,76 @@ def test_missing_signalwire_webhook_signing_key_fails_closed(monkeypatch):
         response = client.post("/signalwire/webhook/call-123")
 
     assert response.status_code == 503
+
+
+def test_signalwire_status_callback_cleans_up_matching_terminal_call():
+    path = "/signalwire/status-callback/call-123"
+    form = {"CallSid": "SW-call-123", "CallStatus": "completed"}
+    call = ActiveCall(
+        call_id="call-123",
+        call_sid="SW-call-123",
+        telephony_provider="signalwire",
+    )
+    with (
+        patch("src.routes.signalwire_webhook.call_manager.get_call", return_value=call),
+        patch(
+            "src.routes.signalwire_webhook.call_manager.cleanup_call",
+            new_callable=AsyncMock,
+        ) as cleanup,
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            path,
+            data=form,
+            headers={"X-SignalWire-Signature": _http_signature(path, form)},
+        )
+
+    assert response.status_code == 200
+    cleanup.assert_awaited_once_with("call-123", reason="signalwire_completed")
+
+
+def test_signalwire_status_callback_rejects_call_sid_mismatch():
+    path = "/signalwire/status-callback/call-123"
+    form = {"CallSid": "SW-other-call", "CallStatus": "completed"}
+    call = ActiveCall(
+        call_id="call-123",
+        call_sid="SW-call-123",
+        telephony_provider="signalwire",
+    )
+    with (
+        patch("src.routes.signalwire_webhook.call_manager.get_call", return_value=call),
+        patch(
+            "src.routes.signalwire_webhook.call_manager.cleanup_call",
+            new_callable=AsyncMock,
+        ) as cleanup,
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            path,
+            data=form,
+            headers={"X-SignalWire-Signature": _http_signature(path, form)},
+        )
+
+    assert response.status_code == 403
+    cleanup.assert_not_awaited()
+
+
+def test_signalwire_status_callback_captures_call_sid_during_start_race():
+    path = "/signalwire/status-callback/call-123"
+    form = {"CallSid": "SW-call-123", "CallStatus": "ringing"}
+    call = ActiveCall(call_id="call-123", telephony_provider="signalwire")
+    with (
+        patch("src.routes.signalwire_webhook.call_manager.get_call", return_value=call),
+        TestClient(app) as client,
+    ):
+        response = client.post(
+            path,
+            data=form,
+            headers={"X-SignalWire-Signature": _http_signature(path, form)},
+        )
+
+    assert response.status_code == 200
+    assert call.call_sid == "SW-call-123"
 
 
 def test_short_signalwire_stream_token_is_rejected_by_settings():
