@@ -293,10 +293,12 @@ class PendingMediaRegistry:
             self._calls[key] = pending
             return pending
 
-    async def attach(self, call_id: str, ws: WebSocket) -> PendingMediaHandler | None:
+    async def attach(
+        self, call_id: str, ws: WebSocket, provider: str = "twilio"
+    ) -> PendingMediaHandler | None:
         async with self._lock:
             pending = self._calls.get(call_id)
-            if pending is None:
+            if pending is None or pending.provider != provider:
                 return None
             if pending.handler is not None:
                 raise RuntimeError("Inbound call already has a media stream")
@@ -309,9 +311,10 @@ class PendingMediaRegistry:
             pending = self._calls.get(call_id)
             return pending.handler if pending is not None else None
 
-    async def contains(self, call_id: str) -> bool:
+    async def contains(self, call_id: str, provider: str | None = None) -> bool:
         async with self._lock:
-            return call_id in self._calls
+            pending = self._calls.get(call_id)
+            return pending is not None and (provider is None or pending.provider == provider)
 
     async def pop(self, call_id: str) -> PendingCall | None:
         async with self._lock:
