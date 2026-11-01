@@ -17,6 +17,7 @@ from src.routes.health import router as health_router
 from src.routes.inbound_dispatch import router as inbound_dispatch_router
 from src.routes.loadtest import router as loadtest_router
 from src.routes.stream import router as stream_router
+from src.routes.signalwire_webhook import router as signalwire_router
 from src.routes.twilio_webhook import router as twilio_router
 
 STATIC_DIR = Path(__file__).parent.parent / "static"
@@ -91,6 +92,7 @@ app.include_router(calls_router, prefix="/relay")
 app.include_router(inbound_dispatch_router, prefix="/relay")
 app.include_router(stream_router, prefix="/relay")
 app.include_router(twilio_router, prefix="/twilio")
+app.include_router(signalwire_router, prefix="/signalwire")
 app.include_router(loadtest_router, prefix="/loadtest")
 
 
