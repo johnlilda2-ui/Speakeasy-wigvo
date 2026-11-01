@@ -58,6 +58,7 @@ def _signalwire_cxml(call_id: str) -> str:
         {
             "url": stream_url,
             "authBearerToken": bearer_token,
+            "codec": "PCMU@8000h",
             "realtime": "true",
         },
     )
