@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 from twilio.request_validator import RequestValidator
 from xml.etree import ElementTree as ET
 
+from src.call_manager import CallManager
 from src.config import Settings, settings
 from src.main import app
 from src.signalwire.auth import validate_signalwire_websocket
@@ -180,6 +181,29 @@ async def test_signalwire_stop_event_marks_handler_closed():
     event = await handler.handle_message(json.dumps({"event": "stop"}))
 
     assert event is not None
+    assert handler.is_closed is True
+
+
+def test_call_manager_router_slot_only_accepts_one_stream_owner():
+    manager = CallManager()
+    first_router = object()
+    second_router = object()
+
+    assert manager.try_register_router("call-123", first_router) is True
+    assert manager.try_register_router("call-123", second_router) is False
+    assert manager.get_router("call-123") is first_router
+
+
+@pytest.mark.asyncio
+async def test_malformed_signalwire_start_event_closes_handler():
+    ws = MagicMock()
+    ws.send_json = AsyncMock()
+    ws.close = AsyncMock()
+    handler = SignalWireMediaStreamHandler(ws=ws, call=ActiveCall(call_id="call-123"))
+
+    event = await handler.handle_message(json.dumps({"event": "start"}))
+
+    assert event is None
     assert handler.is_closed is True
 
 
