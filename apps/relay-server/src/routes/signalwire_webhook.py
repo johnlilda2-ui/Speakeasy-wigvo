@@ -17,6 +17,10 @@ from fastapi.responses import Response
 from src.call_manager import call_manager
 from src.config import settings
 from src.logging_config import call_id_var, call_mode_var, tenant_id_var
+from src.inbound.bootstrap import cleanup_inbound_session
+from src.inbound.media import pending_media_registry
+from src.inbound.service import DispatchError, DispatchNotFound, DispatchUnavailable, dispatch_service
+from uuid import NAMESPACE_URL, uuid5
 from src.realtime.audio_router import AudioRouter
 from src.signalwire.auth import (
     validate_signalwire_http_request,
@@ -92,6 +96,86 @@ def _signalwire_cxml(call_id: str) -> str:
     ).decode("utf-8")
 
 
+@router.post("/incoming")
+async def signalwire_incoming(request: Request):
+    """Resolve a SignalWire DID and establish the provider-aware pending media lifecycle."""
+    form = await validate_signalwire_http_request(request)
+    provider_call_sid = str(form.get("CallSid", "")).strip()
+    inbound_number = str(form.get("To", "")).strip()
+    if not provider_call_sid or not inbound_number:
+        logger.warning("Rejected SignalWire inbound call with missing CallSid/To")
+        return Response(
+            content='<?xml version="1.0" encoding="UTF-8"?><Response><Reject reason="rejected"/></Response>',
+            media_type="application/xml",
+        )
+
+    try:
+        tenant_id, languages = await dispatch_service.resolve_tenant(
+            inbound_number, provider="signalwire"
+        )
+    except DispatchNotFound:
+        logger.warning("Rejected unmapped SignalWire inbound DID=%s", inbound_number)
+        return Response(
+            content='<?xml version="1.0" encoding="UTF-8"?><Response><Reject reason="rejected"/></Response>',
+            media_type="application/xml",
+        )
+    except Exception:
+        logger.exception("SignalWire inbound DID resolution unavailable")
+        return Response(
+            content='<?xml version="1.0" encoding="UTF-8"?><Response><Reject reason="busy"/></Response>',
+            media_type="application/xml",
+        )
+    if len(languages) < 2 or not languages[0] or not languages[1]:
+        logger.error("Rejected SignalWire inbound DID with invalid language mapping=%s", inbound_number)
+        return Response(
+            content='<?xml version="1.0" encoding="UTF-8"?><Response><Reject reason="rejected"/></Response>',
+            media_type="application/xml",
+        )
+
+    deterministic_call_id = uuid5(NAMESPACE_URL, f"wigvo:signalwire:{provider_call_sid}")
+    dispatch = None
+    try:
+        dispatch = await dispatch_service.create_ringing(
+            call_id=deterministic_call_id,
+            tenant_id=tenant_id,
+            provider_call_sid=provider_call_sid,
+            provider="signalwire",
+        )
+        await pending_media_registry.prepare(
+            call_id=dispatch.call_id,
+            tenant_id=dispatch.tenant_id,
+            languages=dispatch.languages or languages,
+            provider_call_sid=provider_call_sid,
+            provider="signalwire",
+        )
+        cxml = _signalwire_cxml(str(dispatch.call_id))
+    except DispatchUnavailable:
+        return Response(
+            content='<?xml version="1.0" encoding="UTF-8"?><Response><Reject reason="busy"/></Response>',
+            media_type="application/xml",
+        )
+    except (DispatchError, RuntimeError, ValueError, HTTPException):
+        logger.exception("Failed to create SignalWire inbound dispatch")
+        if dispatch is not None:
+            try:
+                await dispatch_service.finish(dispatch.call_id, "media_prepare_failed")
+            except Exception:
+                logger.exception("Failed to roll back SignalWire inbound dispatch")
+        return Response(
+            content='<?xml version="1.0" encoding="UTF-8"?><Response><Reject reason="rejected"/></Response>',
+            media_type="application/xml",
+        )
+
+    call_id_var.set(str(dispatch.call_id))
+    logger.info(
+        "SignalWire inbound dispatch created call=%s tenant=%s did=%s",
+        dispatch.call_id,
+        dispatch.tenant_id,
+        inbound_number,
+    )
+    return Response(content=cxml, media_type="application/xml")
+
+
 @router.post("/webhook/{call_id}")
 async def signalwire_webhook(call_id: str, request: Request):
     """Return SignalWire cXML only for a correctly signed provider callback."""
@@ -158,7 +242,10 @@ async def signalwire_status_callback(call_id: str, request: Request):
             if call_status in terminal_statuses
             else f"signalwire_{stream_event.replace('-', '_')}"
         )
-        await call_manager.cleanup_call(call_id, reason=reason)
+        if await pending_media_registry.contains(call_id):
+            await cleanup_inbound_session(call_id, reason)
+        else:
+            await call_manager.cleanup_call(call_id, reason=reason)
 
     return {"status": "ok"}
 
@@ -167,6 +254,19 @@ async def signalwire_status_callback(call_id: str, request: Request):
 async def signalwire_media_stream(ws: WebSocket, call_id: str):
     """Run a SignalWire bidirectional stream through the existing WIGVO router."""
     if not await validate_signalwire_websocket(ws):
+        return
+
+    try:
+        pending_handler = await pending_media_registry.attach(call_id, ws)
+    except RuntimeError:
+        await ws.close(code=4409, reason="SignalWire inbound stream already connected")
+        return
+    if pending_handler is not None:
+        call_id_var.set(call_id)
+        call_mode_var.set("voice_to_voice")
+        tenant_id_var.set(str(pending_handler.pending.tenant_id))
+        await ws.accept()
+        await pending_handler.run()
         return
 
     call = call_manager.get_call(call_id)
