@@ -1,0 +1,51 @@
+name: WIGVO Relay Server Tests
+
+on:
+  push:
+    branches:
+      - feature/soniox-telephony-core
+  pull_request:
+    branches:
+      - main
+      - feature/soniox-telephony-core
+    paths:
+      - "apps/relay-server/**"
+      - ".github/workflows/relay-server-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: relay-server-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  relay-server-unit-tests:
+    name: Relay server unit and component tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: apps/relay-server
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: apps/relay-server/uv.lock
+
+      - name: Install locked dependencies
+        run: uv sync --locked --all-groups
+
+      - name: Run unit and component tests
+        run: uv run --locked pytest -q --ignore=tests/integration --ignore=tests/e2e
