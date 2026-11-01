@@ -175,7 +175,7 @@ async def twilio_status_callback(
             if call_status in terminal_statuses
             else f"twilio_{stream_event.replace('-', '_')}"
         )
-        if await pending_media_registry.contains(call_id):
+        if await pending_media_registry.contains(call_id, provider="twilio"):
             await cleanup_inbound_session(call_id, reason)
         else:
             await call_manager.cleanup_call(call_id, reason=reason)
