@@ -267,3 +267,12 @@ def test_signalwire_stream_error_callback_ends_both_call_legs():
     assert response.status_code == 200
     close.assert_awaited_once_with(reason="signalwire_stream_error")
     assert session.session_id not in soniox_app.SESSIONS
+
+
+def test_phone_call_page_exposes_provider_selector_without_replacing_root_demo():
+    with TestClient(soniox_app.app) as client:
+        response = client.get("/phone-call")
+    assert response.status_code == 200
+    assert 'id="provider"' in response.text
+    assert 'value="signalwire"' in response.text
+    assert 'provider:document.querySelector("#provider").value' in response.text
