@@ -57,8 +57,8 @@ class InboundDispatchService:
         self._connection_cleanup_started: set[UUID] = set()
         self._sweeper_task: asyncio.Task[None] | None = None
 
-    async def resolve_tenant(self, inbound_number: str) -> tuple[UUID, list[str]]:
-        result = await repository.resolve_inbound_tenant(inbound_number)
+    async def resolve_tenant(self, inbound_number: str, provider: str = "twilio") -> tuple[UUID, list[str]]:
+        result = await repository.resolve_inbound_tenant(inbound_number, provider)
         if result is None:
             raise DispatchNotFound("Inbound DID is not assigned to a tenant")
         return result
@@ -69,6 +69,7 @@ class InboundDispatchService:
         call_id: UUID,
         tenant_id: UUID,
         provider_call_sid: str | None,
+        provider: str = "twilio",
     ) -> DispatchRecord:
         """A-owned incoming route calls this before opening pending media."""
         async with self._create_lock:
@@ -79,6 +80,7 @@ class InboundDispatchService:
                 call_id=call_id,
                 tenant_id=tenant_id,
                 provider_call_sid=provider_call_sid,
+                provider=provider,
             )
             self._known_calls.add(dispatch.call_id)
             return dispatch
