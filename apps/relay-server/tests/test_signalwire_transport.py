@@ -165,6 +165,11 @@ async def test_signalwire_start_rejects_non_pcmu_format():
     assert handler.is_closed is True
 
 
+def test_non_ascii_signalwire_stream_token_is_rejected_by_settings():
+    with pytest.raises(ValueError, match="ASCII bytes"):
+        Settings(signalwire_stream_token="é" * 40)
+
+
 @pytest.mark.asyncio
 async def test_signalwire_stop_event_marks_handler_closed():
     ws = MagicMock()
@@ -231,5 +236,5 @@ def test_missing_signalwire_webhook_signing_key_fails_closed(monkeypatch):
 
 
 def test_short_signalwire_stream_token_is_rejected_by_settings():
-    with pytest.raises(ValueError, match="at least 32 bytes"):
+    with pytest.raises(ValueError, match="at least 32 ASCII bytes"):
         Settings(signalwire_stream_token="too-short")
