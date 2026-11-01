@@ -214,39 +214,55 @@ async def get_user_tenant_id(user_id: UUID | str) -> UUID | None:
     return _as_uuid(value) if value is not None else None
 
 
-async def get_tenant_outbound_number(tenant_id: UUID | str) -> str:
-    """Resolve tenant telephony config; missing/blank config is rejected."""
+async def get_tenant_outbound_number(
+    tenant_id: UUID | str,
+    provider: str = "twilio",
+) -> str:
+    """Resolve the selected provider's tenant number; never cross providers."""
+    provider = provider.strip().lower()
+    if provider not in {"twilio", "signalwire"}:
+        raise ValueError("Unsupported telephony provider")
+
+    fallback_number = (
+        settings.twilio_phone_number
+        if provider == "twilio"
+        else settings.signalwire_phone_number
+    )
+    default_tenant = "00000000-0000-0000-0000-000000000001"
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         number = await conn.fetchval(
             """
             SELECT outbound_number
             FROM tenant_call_config
-            WHERE tenant_id = $1::uuid AND provider = 'twilio'
+            WHERE tenant_id = $1::uuid AND provider = $2
             """,
             _as_uuid(tenant_id),
+            provider,
         )
-        # Preserve existing single-tenant behavior during rollout without
-        # hard-coding a phone number into migration history. The legacy value
-        # is copied into the default tenant config once, then DB config wins.
-        default_tenant = "00000000-0000-0000-0000-000000000001"
-        if (
-            not number
-            and str(tenant_id) == default_tenant
-            and settings.twilio_phone_number
-        ):
+
+        # Keep the historic single-tenant environment fallback, but only for
+        # the default tenant and only for the selected provider. Persist it so
+        # subsequent reads use the tenant config as the source of truth.
+        if not number and str(tenant_id) == default_tenant and fallback_number:
             number = await conn.fetchval(
                 """
                 UPDATE tenant_call_config
-                SET outbound_number = $2, updated_at = now()
+                SET outbound_number = $2, provider = $3, updated_at = now()
                 WHERE tenant_id = $1::uuid AND outbound_number = ''
                 RETURNING outbound_number
                 """,
                 UUID(default_tenant),
-                settings.twilio_phone_number,
+                fallback_number,
+                provider,
             )
+
     if not number:
-        raise LookupError(f"No outbound number configured for tenant {tenant_id}")
+        raise LookupError(
+            f"No outbound number configured for tenant {tenant_id} "
+            f"and provider {provider}"
+        )
     return str(number)
 
 
