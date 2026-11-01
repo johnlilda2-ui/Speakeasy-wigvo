@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -86,7 +87,7 @@ class Settings(BaseSettings):
         value = value.strip()
         if value:
             try:
-                UUID(value)
+                value = str(UUID(value))
             except ValueError as exc:
                 raise ValueError("signalwire_project_id must be a UUID Project ID") from exc
         return value
@@ -96,10 +97,7 @@ class Settings(BaseSettings):
     def validate_signalwire_phone_number(cls, value: str) -> str:
         value = value.strip()
         if value and (
-            not value.startswith("+")
-            or not value[1:].isdigit()
-            or not 2 <= len(value[1:]) <= 15
-            or value[1] == "0"
+            not re.fullmatch(r"\+[1-9][0-9]{1,14}", value)
         ):
             raise ValueError("signalwire_phone_number must be in E.164 format")
         return value
