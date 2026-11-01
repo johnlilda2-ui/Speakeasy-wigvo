@@ -7,7 +7,7 @@ import json
 import logging
 import re
 from urllib.error import HTTPError, URLError
-from urllib.parse import quote, urlencode
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 from uuid import UUID
 
@@ -32,8 +32,22 @@ def _credentials() -> tuple[str, str, str]:
         UUID(project_id)
     except ValueError as exc:
         raise RuntimeError("SIGNALWIRE_PROJECT_ID must be a UUID Project ID") from exc
-    if not space_url.startswith("https://") or not space_url.endswith(".signalwire.com") and ".signalwire.com/" not in space_url:
-        raise RuntimeError("SIGNALWIRE_SPACE_URL must be a trusted HTTPS SignalWire Space")
+    parsed = urlsplit(space_url)
+    hostname = (parsed.hostname or "").lower()
+    if (
+        parsed.scheme != "https"
+        or not hostname.endswith(".signalwire.com")
+        or hostname == "signalwire.com"
+        or parsed.port is not None
+        or parsed.path
+        or parsed.query
+        or parsed.fragment
+        or parsed.username
+        or parsed.password
+    ):
+        raise RuntimeError(
+            "SIGNALWIRE_SPACE_URL must be an HTTPS SignalWire Space origin"
+        )
     return space_url, project_id, api_token
 
 
