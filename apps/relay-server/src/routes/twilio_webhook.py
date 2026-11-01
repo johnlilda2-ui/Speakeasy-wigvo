@@ -84,6 +84,7 @@ async def twilio_incoming(request: Request):
             call_id=deterministic_call_id,
             tenant_id=tenant_id,
             provider_call_sid=provider_call_sid,
+            provider="twilio",
         )
         await pending_media_registry.prepare(
             call_id=dispatch.call_id,
