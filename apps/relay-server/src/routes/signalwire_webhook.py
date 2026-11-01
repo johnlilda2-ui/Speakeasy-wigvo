@@ -1,6 +1,7 @@
 """SignalWire cXML webhook and bidirectional Media Stream endpoints."""
 from __future__ import annotations
 
+import hmac
 import logging
 import xml.etree.ElementTree as ET
 
@@ -83,6 +84,9 @@ def _signalwire_cxml(call_id: str) -> str:
 async def signalwire_webhook(call_id: str, request: Request):
     """Return SignalWire cXML only for a correctly signed provider callback."""
     await validate_signalwire_http_request(request)
+    call = call_manager.get_call(call_id)
+    if call is None or call.telephony_provider != "signalwire":
+        raise HTTPException(status_code=404, detail="SignalWire call not found")
     cxml = _signalwire_cxml(call_id)
     call_id_var.set(call_id)
     logger.info("SignalWire cXML webhook served for call=%s", call_id)
@@ -98,6 +102,16 @@ async def signalwire_status_callback(call_id: str, request: Request):
     call_sid = str(form.get("CallSid", "")).strip()
 
     call_id_var.set(call_id)
+    call = call_manager.get_call(call_id)
+    if call is not None:
+        if call.telephony_provider != "signalwire":
+            raise HTTPException(status_code=404, detail="SignalWire call not found")
+        if call.call_sid and call_sid and not hmac.compare_digest(call.call_sid, call_sid):
+            raise HTTPException(status_code=403, detail="SignalWire CallSid mismatch")
+        if not call.call_sid and call_sid:
+            # Capture the provider SID if a status callback races the REST response.
+            call.call_sid = call_sid
+
     logger.info(
         "SignalWire status callback: call_id=%s status=%s stream_event=%s sid=%s",
         call_id,
