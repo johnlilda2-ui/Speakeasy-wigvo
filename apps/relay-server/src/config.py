@@ -67,8 +67,15 @@ class Settings(BaseSettings):
     @field_validator("signalwire_stream_token")
     @classmethod
     def validate_signalwire_stream_token(cls, value: str) -> str:
-        if value and len(value.encode("utf-8")) < 32:
-            raise ValueError("signalwire_stream_token must be at least 32 bytes")
+        if value and (
+            len(value.encode("utf-8")) < 32
+            or not value.isascii()
+            or value.strip() != value
+        ):
+            raise ValueError(
+                "signalwire_stream_token must be at least 32 ASCII bytes "
+                "without surrounding whitespace"
+            )
         return value
 
     @field_validator("pickup_token_ttl_s")
