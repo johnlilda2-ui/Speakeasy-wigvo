@@ -555,6 +555,15 @@ async def home() -> str:
     return HTML_PAGE
 
 
+@app.get("/phone-call", response_class=HTMLResponse)
+async def phone_call_home() -> HTMLResponse:
+    """Expose the two-party PSTN test UI without replacing the Krisp browser demo at /."""
+    return HTMLResponse(
+        HTML_PAGE,
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+    )
+
+
 @app.post("/api/calls")
 async def start_call(payload: StartCallRequest) -> JSONResponse:
     try:
@@ -966,6 +975,10 @@ small{color:#9eabca}
 let sid="";
 const statusEl=document.querySelector("#status"),log=document.querySelector("#log");
 function add(x){log.textContent += x+"\n"; log.scrollTop=log.scrollHeight}
+fetch("/health",{cache:"no-store"}).then(r=>r.json()).then(cfg=>{
+  const option=document.querySelector('#provider option[value="signalwire"]');
+  if(option&&!cfg.signalwire_configured){option.disabled=true;add("SignalWire is not configured on this service yet.");}
+}).catch(()=>{});
 document.querySelector("#start").onclick=async()=>{
   statusEl.textContent="Starting…";
   const body={
