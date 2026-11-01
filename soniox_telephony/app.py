@@ -541,6 +541,12 @@ async def health() -> dict[str, Any]:
         "krisp_configured": bool(os.getenv("KRISP_API_KEY", "").strip()),
         "legacy_telephony_soniox_configured": bool(SONIOX_API_KEY),
         "twilio_configured": bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_PHONE_NUMBER),
+        "signalwire_configured": bool(
+            SIGNALWIRE_SPACE_URL and SIGNALWIRE_PROJECT_ID and SIGNALWIRE_API_TOKEN
+            and SIGNALWIRE_PHONE_NUMBER and SIGNALWIRE_SIGNING_KEY
+            and len(SIGNALWIRE_STREAM_TOKEN.encode("utf-8")) >= 32
+            and SIGNALWIRE_STREAM_TOKEN.isascii()
+        ),
     }
 
 
@@ -558,7 +564,13 @@ async def start_call(payload: StartCallRequest) -> JSONResponse:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if payload.language_a.lower() == payload.language_b.lower():
         raise HTTPException(status_code=422, detail="language_a and language_b must be different")
-    ensure_configured()
+    provider = payload.provider.strip().lower()
+    if provider not in {"twilio", "signalwire"}:
+        raise HTTPException(status_code=422, detail="provider must be 'twilio' or 'signalwire'")
+    try:
+        ensure_configured(provider)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     session_id = str(uuid4())
     session = CallSession(
@@ -567,6 +579,7 @@ async def start_call(payload: StartCallRequest) -> JSONResponse:
         language_b=payload.language_b.lower(),
         phone_a=phone_a,
         phone_b=phone_b,
+        provider=provider,
     )
     session.legs = {
         "a": Leg(session, "a", session.language_a, session.language_b, SONIOX_TTS_VOICE_B),
@@ -574,19 +587,34 @@ async def start_call(payload: StartCallRequest) -> JSONResponse:
     }
     SESSIONS[session_id] = session
 
-    try:
-        sid_a, sid_b = await asyncio.gather(
-            initiate_twilio_call(phone_a, session_id, "a"),
-            initiate_twilio_call(phone_b, session_id, "b"),
-        )
-        session.call_sids = {"a": sid_a, "b": sid_b}
-    except Exception:
+    initiator = initiate_signalwire_call if provider == "signalwire" else initiate_twilio_call
+    results = await asyncio.gather(
+        initiator(phone_a, session_id, "a"),
+        initiator(phone_b, session_id, "b"),
+        return_exceptions=True,
+    )
+    for leg_name, result in zip(("a", "b"), results):
+        if isinstance(result, str) and result:
+            session.call_sids[leg_name] = result
+    failures = [result for result in results if isinstance(result, BaseException)]
+    if failures:
+        await session.close(reason="call_setup_failed")
         SESSIONS.pop(session_id, None)
-        raise
+        log.error(
+            "WIGVO call setup failed provider=%s session=%s failed_legs=%d",
+            provider,
+            session_id,
+            len(failures),
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not start both {provider} call legs; any created leg was terminated.",
+        )
 
     return JSONResponse({
         "ok": True,
         "session_id": session_id,
+        "provider": session.provider,
         "call_sids": session.call_sids,
         "languages": {"a": session.language_a, "b": session.language_b},
     })
@@ -599,6 +627,7 @@ async def call_status(session_id: str) -> JSONResponse:
         raise HTTPException(status_code=404, detail="Call session not found")
     return JSONResponse({
         "session_id": session_id,
+        "provider": session.provider,
         "created_at": session.created_at,
         "closed": session.closed,
         "legs": {
@@ -606,7 +635,7 @@ async def call_status(session_id: str) -> JSONResponse:
                 "language": v.language,
                 "target_language": v.target_language,
                 "call_sid": v.call_sid,
-                "stream_connected": bool(v.twilio_ws and v.stream_sid),
+                "stream_connected": bool(v.media_ws and v.stream_sid),
             }
             for k, v in session.legs.items()
         },
@@ -617,7 +646,7 @@ async def call_status(session_id: str) -> JSONResponse:
 async def twilio_voice(session_id: str, leg: str, request: Request) -> Response:
     session = SESSIONS.get(session_id)
     voice = VoiceResponse()
-    if not session or leg not in ("a", "b"):
+    if not session or leg not in ("a", "b") or session.provider != "twilio":
         voice.reject(reason="rejected")
         return Response(str(voice), media_type="application/xml")
 
@@ -634,7 +663,7 @@ async def twilio_voice(session_id: str, leg: str, request: Request) -> Response:
 @app.post("/twilio/status/{session_id}/{leg}")
 async def twilio_status(session_id: str, leg: str, request: Request) -> dict[str, str]:
     session = SESSIONS.get(session_id)
-    if session and leg in session.legs:
+    if session and session.provider == "twilio" and leg in session.legs:
         form = await validate_twilio_request(request)
         sid = form.get("CallSid", "")
         if sid:
@@ -650,12 +679,12 @@ async def twilio_status(session_id: str, leg: str, request: Request) -> dict[str
 @app.websocket("/twilio/stream/{session_id}/{leg}")
 async def twilio_stream(ws: WebSocket, session_id: str, leg: str) -> None:
     session = SESSIONS.get(session_id)
-    if not session or leg not in ("a", "b"):
+    if not session or leg not in ("a", "b") or session.provider != "twilio":
         await ws.close(code=4404)
         return
     await ws.accept()
     current = session.legs[leg]
-    current.twilio_ws = ws
+    current.media_ws = ws
     await session.send_event({"type": "leg_connecting", "leg": leg})
 
     try:
@@ -672,8 +701,12 @@ async def twilio_stream(ws: WebSocket, session_id: str, leg: str) -> None:
                 await session.send_event({"type": "media_connected", "leg": leg})
             elif event == "start":
                 start = data.get("start") or {}
-                current.stream_sid = data.get("streamSid") or ""
-                current.call_sid = start.get("callSid") or current.call_sid
+                current.stream_sid = data.get("streamSid") or start.get("streamSid") or ""
+                incoming_sid = start.get("callSid") or current.call_sid
+                if current.call_sid and incoming_sid and current.call_sid != incoming_sid:
+                    await ws.close(code=4403, reason="Twilio CallSid mismatch")
+                    break
+                current.call_sid = incoming_sid
                 session.call_sids[leg] = current.call_sid
                 current.twilio_connected.set()
                 await session.send_event({"type": "connected", "leg": leg})
