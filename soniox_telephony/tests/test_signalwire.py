@@ -276,3 +276,111 @@ def test_phone_call_page_exposes_provider_selector_without_replacing_root_demo()
     assert 'id="provider"' in response.text
     assert 'value="signalwire"' in response.text
     assert 'provider:document.querySelector("#provider").value' in response.text
+
+
+def test_signalwire_create_call_uses_compatibility_api(monkeypatch):
+    import urllib.parse
+    import signalwire
+
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def read(self):
+            return b'{"sid":"SW-created-call"}'
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["body"] = urllib.parse.parse_qs(request.data.decode("utf-8"))
+        captured["authorization"] = request.get_header("Authorization")
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr(signalwire, "urlopen", fake_urlopen)
+    sid = signalwire.create_call(
+        space_url="https://wigvo.signalwire.com",
+        project_id="00000000-0000-4000-8000-000000000001",
+        api_token="test-api-token",
+        phone="+12025550101",
+        from_number="+12025550100",
+        public_base_url=PUBLIC_BASE,
+        session_id="session-test-123",
+        leg="a",
+    )
+
+    assert sid == "SW-created-call"
+    assert captured["url"].endswith("/Accounts/00000000-0000-4000-8000-000000000001/Calls")
+    assert captured["body"]["Url"] == [
+        f"{PUBLIC_BASE}/signalwire/voice/session-test-123/a"
+    ]
+    assert captured["body"]["StatusCallback"] == [
+        f"{PUBLIC_BASE}/signalwire/status/session-test-123/a"
+    ]
+    assert captured["body"]["StatusCallbackEvent"] == [
+        "initiated",
+        "ringing",
+        "answered",
+        "completed",
+    ]
+    assert captured["authorization"].startswith("Basic ")
+    assert captured["timeout"] == 20
+
+
+def test_signalwire_stream_rejects_missing_bearer_before_upgrade():
+    from starlette.websockets import WebSocketDisconnect
+
+    session = _session()
+    with TestClient(soniox_app.app) as client:
+        with pytest.raises(WebSocketDisconnect) as disconnected:
+            with client.websocket_connect(
+                f"/signalwire/stream/{session.session_id}/a"
+            ):
+                pass
+    assert disconnected.value.code == 4403
+    assert session.legs["a"].media_ws is None
+
+
+def test_signalwire_stream_accepts_bearer_and_normalizes_nested_start(monkeypatch):
+    session = _session()
+    connect_soniox = AsyncMock()
+    start_reader = AsyncMock()
+    close_leg = AsyncMock()
+    close_session = AsyncMock()
+    monkeypatch.setattr(soniox_app.Leg, "connect_soniox", connect_soniox)
+    monkeypatch.setattr(soniox_app.Leg, "start_stt_reader", start_reader)
+    monkeypatch.setattr(soniox_app.Leg, "close", close_leg)
+    monkeypatch.setattr(session, "close", close_session)
+
+    with TestClient(soniox_app.app) as client:
+        with client.websocket_connect(
+            f"/signalwire/stream/{session.session_id}/a",
+            headers={"Authorization": f"Bearer {STREAM_TOKEN}"},
+        ) as ws:
+            ws.send_json(
+                {
+                    "event": "start",
+                    "start": {
+                        "streamSid": "SW-stream-a",
+                        "callSid": "SW-call-a",
+                        "mediaFormat": {
+                            "encoding": "audio/x-mulaw",
+                            "sampleRate": 8000,
+                            "channels": 1,
+                        },
+                    },
+                }
+            )
+            ws.send_json({"event": "stop"})
+
+    connect_soniox.assert_awaited_once()
+    start_reader.assert_awaited_once()
+    close_leg.assert_awaited_once()
+    close_session.assert_awaited_once_with(reason="leg_a_disconnected")
+    assert session.legs["a"].stream_sid == "SW-stream-a"
+    assert session.legs["a"].call_sid == "SW-call-a"
+    assert session.session_id not in soniox_app.SESSIONS
