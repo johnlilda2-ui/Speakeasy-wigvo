@@ -463,3 +463,39 @@ def test_migration_keeps_dispatch_off_the_supabase_data_api():
     assert "ENABLE ROW LEVEL SECURITY" in migration
     assert "REVOKE ALL ON TABLE inbound_call_dispatch FROM anon, authenticated" in migration
     assert "idx_inbound_dispatch_tenant_waiting_fifo" in migration
+
+
+@pytest.mark.asyncio
+async def test_inbound_tenant_lookup_is_scoped_to_provider(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class _Conn:
+        async def fetchrow(self, query: str, *params):
+            captured["query"] = query
+            captured["params"] = params
+            return {"tenant_id": TENANT_A, "languages": ["ko", "en"]}
+
+    async def fake_pool():
+        return _Pool(_Conn())
+
+    monkeypatch.setattr(repository, "get_pool", fake_pool)
+    result = await repository.resolve_inbound_tenant(
+        "+12025550100", provider="signalwire"
+    )
+
+    assert result == (TENANT_A, ["ko", "en"])
+    assert "WHERE provider = $1 AND inbound_number = $2" in str(captured["query"])
+    assert captured["params"] == ("signalwire", "+12025550100")
+
+
+def test_provider_identity_migration_namespaces_call_sids():
+    migration = (
+        __import__("pathlib").Path(__file__).parents[1]
+        / "migrations"
+        / "005_inbound_provider_identity.up.sql"
+    ).read_text()
+
+    assert "ADD COLUMN IF NOT EXISTS provider text NOT NULL DEFAULT 'twilio'" in migration
+    assert "DROP CONSTRAINT IF EXISTS inbound_call_dispatch_provider_call_sid_key" in migration
+    assert "ON inbound_call_dispatch (provider, provider_call_sid)" in migration
+    assert "CHECK (provider IN ('twilio', 'signalwire'))" in migration
