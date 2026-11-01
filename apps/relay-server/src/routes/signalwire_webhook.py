@@ -257,7 +257,9 @@ async def signalwire_media_stream(ws: WebSocket, call_id: str):
         return
 
     try:
-        pending_handler = await pending_media_registry.attach(call_id, ws)
+        pending_handler = await pending_media_registry.attach(
+            call_id, ws, provider="signalwire"
+        )
     except RuntimeError:
         await ws.close(code=4409, reason="SignalWire inbound stream already connected")
         return
