@@ -26,7 +26,10 @@ from src.observability import tracer
 from src.prompt.generator_v3 import generate_session_a_prompt, generate_session_b_prompt
 from src.realtime.sessions.session_manager import DualSessionManager
 from src.tools.definitions import get_tools_for_mode
-from src.telephony.outbound import make_provider_call_async
+from src.telephony.outbound import (
+    hangup_provider_call_async,
+    make_provider_call_async,
+)
 from src.types import (
     ActiveCall,
     CallEndRequest,
@@ -180,7 +183,7 @@ async def start_call(req: CallStartRequest, request: Request):
         call.call_sid = f"loadtest-{req.call_id}"
     else:
         try:
-            call.call_sid = await make_provider_call_async(
+            provider_call_sid = await make_provider_call_async(
                 phone_number=req.phone_number,
                 call_id=req.call_id,
                 tenant_id=tenant_id,
@@ -204,6 +207,30 @@ async def start_call(req: CallStartRequest, request: Request):
                 status_code=502,
                 detail="Failed to initiate phone call",
             ) from e
+
+        # A manual hang-up or terminal callback may remove the call while
+        # the provider's REST create-call request is still in flight. In that
+        # case, immediately terminate the newly-created PSTN leg instead of
+        # returning a stale, apparently successful call response.
+        if call_manager.get_call(req.call_id) is not call:
+            try:
+                await hangup_provider_call_async(
+                    call.telephony_provider,
+                    provider_call_sid,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to terminate provider call created after WIGVO cleanup "
+                    "(call_id=%s, provider=%s)",
+                    req.call_id,
+                    call.telephony_provider,
+                )
+            raise HTTPException(
+                status_code=409,
+                detail="Call ended while the phone provider was connecting",
+            )
+
+        call.call_sid = provider_call_sid
 
     # WebSocket URL 생성
     ws_base = settings.relay_server_url.replace("http", "ws")
