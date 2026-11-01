@@ -393,3 +393,45 @@ async def test_cancelled_signalwire_create_hangs_up_call_created_by_worker(monke
             await task
 
     hangup.assert_awaited_once_with("SW-created-during-cancel")
+
+
+@pytest.mark.asyncio
+async def test_cancelled_provider_dispatch_hangs_up_late_created_twilio_call(monkeypatch):
+    import asyncio
+    from unittest.mock import AsyncMock
+    from src.telephony.outbound import make_provider_call_async
+
+    started = asyncio.Event()
+    release_provider = asyncio.Event()
+
+    async def slow_twilio_create(**_kwargs):
+        started.set()
+        await release_provider.wait()
+        return "CA-created-during-cancel"
+
+    monkeypatch.setattr(settings, "telephony_provider", "twilio")
+    with (
+        patch(
+            "src.twilio.outbound.make_call_async",
+            side_effect=slow_twilio_create,
+        ),
+        patch(
+            "src.telephony.outbound.hangup_provider_call_async",
+            new=AsyncMock(),
+        ) as hangup,
+    ):
+        task = asyncio.create_task(
+            make_provider_call_async(
+                phone_number="+14155550123",
+                call_id="call-123",
+                tenant_id="00000000-0000-0000-0000-000000000001",
+            )
+        )
+        await started.wait()
+        task.cancel()
+        release_provider.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    hangup.assert_awaited_once_with("twilio", "CA-created-during-cancel")
