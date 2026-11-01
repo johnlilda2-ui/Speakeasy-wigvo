@@ -1,4 +1,5 @@
 from pathlib import Path
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from pydantic import Field, field_validator
@@ -22,8 +23,15 @@ class Settings(BaseSettings):
     # relay_server_url을 사용하되, 프록시/내부 URL과 다르면 반드시 명시한다.
     public_callback_base_url: str = ""
 
-    # SignalWire Compatibility API: dashboard webhook signing key plus the
-    # application-generated bearer token sent to the media WebSocket.
+    # Provider selection is opt-in; existing deployments remain on Twilio.
+    telephony_provider: str = "twilio"
+
+    # SignalWire Compatibility API credentials and the purchased PSTN number.
+    # Space URL must be an HTTPS origin, e.g. https://example.signalwire.com.
+    signalwire_space_url: str = ""
+    signalwire_project_id: str = ""
+    signalwire_api_token: str = ""
+    signalwire_phone_number: str = ""
     signalwire_signing_key: str = ""
     signalwire_stream_token: str = ""
 
@@ -63,6 +71,35 @@ class Settings(BaseSettings):
     inbound_wait_timeout_s: int = 120
     inbound_reconnect_grace_s: float = 15.0
     dispatch_sweep_interval_s: float = 5.0
+
+    @field_validator("telephony_provider")
+    @classmethod
+    def validate_telephony_provider(cls, value: str) -> str:
+        provider = value.strip().lower()
+        if provider not in {"twilio", "signalwire"}:
+            raise ValueError("telephony_provider must be 'twilio' or 'signalwire'")
+        return provider
+
+    @field_validator("signalwire_space_url")
+    @classmethod
+    def validate_signalwire_space_url(cls, value: str) -> str:
+        value = value.strip().rstrip("/")
+        if not value:
+            return value
+        parsed = urlsplit(value)
+        if (
+            parsed.scheme != "https"
+            or not parsed.hostname
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+            or parsed.username
+            or parsed.password
+        ):
+            raise ValueError(
+                "signalwire_space_url must be an HTTPS origin without path or credentials"
+            )
+        return value
 
     @field_validator("signalwire_stream_token")
     @classmethod
