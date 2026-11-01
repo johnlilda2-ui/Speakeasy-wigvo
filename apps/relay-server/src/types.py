@@ -288,6 +288,8 @@ class CallMetrics(BaseModel):
 class ActiveCall(BaseModel):
     call_id: str
     call_sid: str = ""
+    # PSTN provider associated with call_sid; defaults to Twilio for legacy calls.
+    telephony_provider: str = "twilio"
     tenant_id: UUID = DEFAULT_TENANT_ID
     mode: CallMode = CallMode.RELAY
     source_language: str = "en"
