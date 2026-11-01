@@ -5,7 +5,7 @@ import asyncio
 import logging
 import xml.etree.ElementTree as ET
 
-from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 
 from src.call_manager import call_manager
@@ -74,7 +74,7 @@ def _signalwire_cxml(call_id: str) -> str:
 
 
 @router.post("/webhook/{call_id}")
-async def signalwire_webhook(call_id: str, request):
+async def signalwire_webhook(call_id: str, request: Request):
     """Return SignalWire cXML only for a correctly signed provider callback."""
     await validate_signalwire_http_request(request)
     cxml = _signalwire_cxml(call_id)
