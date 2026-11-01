@@ -80,6 +80,17 @@ class Settings(BaseSettings):
             raise ValueError("telephony_provider must be 'twilio' or 'signalwire'")
         return provider
 
+    @field_validator("signalwire_project_id")
+    @classmethod
+    def validate_signalwire_project_id(cls, value: str) -> str:
+        value = value.strip()
+        if value:
+            try:
+                UUID(value)
+            except ValueError as exc:
+                raise ValueError("signalwire_project_id must be a UUID Project ID") from exc
+        return value
+
     @field_validator("signalwire_phone_number")
     @classmethod
     def validate_signalwire_phone_number(cls, value: str) -> str:
@@ -87,7 +98,7 @@ class Settings(BaseSettings):
         if value and (
             not value.startswith("+")
             or not value[1:].isdigit()
-            or not 1 <= len(value[1:]) <= 14
+            or not 2 <= len(value[1:]) <= 15
             or value[1] == "0"
         ):
             raise ValueError("signalwire_phone_number must be in E.164 format")
