@@ -72,6 +72,7 @@ class SignalWireMediaStreamHandler(TwilioMediaStreamHandler):
                 self.call.call_id,
                 exc,
             )
+            self._closed = True
             return None
 
         match event.event:
