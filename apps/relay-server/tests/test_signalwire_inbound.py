@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from twilio.request_validator import RequestValidator
 
 from src.config import settings
-from src.inbound.media import PendingCall, PendingMediaHandler
+from src.inbound.media import PendingCall, PendingMediaHandler, pending_media_registry
 from src.inbound.models import DispatchRecord, DispatchState
 from src.main import app
 from src.signalwire.media_stream import SignalWireMediaStreamHandler
@@ -114,3 +114,29 @@ def test_signalwire_incoming_creates_provider_scoped_dispatch_and_cxml():
     prepare.assert_awaited_once()
     assert prepare.await_args.kwargs["provider"] == "signalwire"
     assert prepare.await_args.kwargs["provider_call_sid"] == form["CallSid"]
+
+
+@pytest.mark.asyncio
+async def test_provider_specific_stream_attach_cannot_claim_other_provider_call():
+    await pending_media_registry.prepare(
+        call_id=CALL_ID,
+        tenant_id=TENANT_ID,
+        languages=["ko", "en"],
+        provider_call_sid="CA-twilio-inbound",
+        provider="twilio",
+    )
+    ws = FakeWebSocket()
+    try:
+        wrong_provider = await pending_media_registry.attach(
+            str(CALL_ID), ws, provider="signalwire"
+        )
+        assert wrong_provider is None
+
+        twilio_handler = await pending_media_registry.attach(
+            str(CALL_ID), ws, provider="twilio"
+        )
+        assert twilio_handler is not None
+        assert twilio_handler.call.telephony_provider == "twilio"
+        await twilio_handler.close()
+    finally:
+        await pending_media_registry.pop(str(CALL_ID))
