@@ -224,3 +224,65 @@ def test_signalwire_terminal_callback_rejects_mismatched_pending_call_sid():
 
     assert response.status_code == 403
     cleanup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "start,expected_closed",
+    [
+        (
+            {
+                "streamSid": "SW-stream",
+                "callSid": "SW-someone-elses-call",
+                "mediaFormat": {
+                    "encoding": "audio/x-mulaw",
+                    "sampleRate": 8000,
+                    "channels": 1,
+                },
+            },
+            True,
+        ),
+        (
+            {
+                "streamSid": "SW-stream",
+                "callSid": "SW-inbound",
+                "mediaFormat": {
+                    "encoding": "audio/x-L16",
+                    "sampleRate": 24000,
+                    "channels": 1,
+                },
+            },
+            True,
+        ),
+        (
+            {
+                "callSid": "SW-inbound",
+                "mediaFormat": {
+                    "encoding": "audio/x-mulaw",
+                    "sampleRate": 8000,
+                    "channels": 1,
+                },
+            },
+            True,
+        ),
+    ],
+)
+async def test_signalwire_rejects_invalid_start_metadata(start, expected_closed):
+    import json
+
+    pending = PendingCall(
+        call_id=CALL_ID,
+        tenant_id=TENANT_ID,
+        languages=("ko", "en"),
+        provider_call_sid="SW-inbound",
+        provider="signalwire",
+    )
+    handler = PendingMediaHandler(FakeWebSocket(), pending)
+
+    event = await handler.media.handle_message(
+        json.dumps({"event": "start", "start": start})
+    )
+
+    assert event is None
+    assert handler.media.is_closed is expected_closed
+    await handler.close()
