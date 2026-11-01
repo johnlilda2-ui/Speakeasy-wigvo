@@ -493,6 +493,13 @@ Call sites: App WS disconnect, Twilio disconnect, status-callback, manual end, s
 | `TWILIO_ACCOUNT_SID` | | Twilio Account SID |
 | `TWILIO_AUTH_TOKEN` | | Twilio Auth Token |
 | `TWILIO_PHONE_NUMBER` | | Twilio outbound phone number |
+| `TELEPHONY_PROVIDER` | `twilio` | PSTN provider: `twilio` or `signalwire` |
+| `SIGNALWIRE_SPACE_URL` | | HTTPS SignalWire Space origin (e.g. `https://your-space.signalwire.com`) |
+| `SIGNALWIRE_PROJECT_ID` | | SignalWire Project ID (UUID) |
+| `SIGNALWIRE_API_TOKEN` | | SignalWire Compatibility API token (server-side only) |
+| `SIGNALWIRE_PHONE_NUMBER` | | Default-tenant SignalWire DID in E.164 format |
+| `SIGNALWIRE_SIGNING_KEY` | | Dashboard Signing Key for webhook signature validation |
+| `SIGNALWIRE_STREAM_TOKEN` | | Separate random bearer secret, minimum 32 ASCII characters |
 | `OPENAI_API_KEY` | | OpenAI API key |
 | `OPENAI_REALTIME_MODEL` | `gpt-realtime` | Realtime model |
 | `SUPABASE_URL` | | Supabase URL |
@@ -522,6 +529,19 @@ Call sites: App WS disconnect, Twilio disconnect, status-callback, manual end, s
 | `MAX_SPEECH_DURATION_S` | `8.0` | Force commit after max speech time (seconds) |
 
 ---
+
+
+### SignalWire outbound calling
+
+Set `TELEPHONY_PROVIDER=signalwire` to opt in; the default remains `twilio`.
+Configure all six `SIGNALWIRE_*` server variables above and keep the API token,
+Signing Key, and stream bearer secret out of browser/client environment variables.
+The default tenant can use `SIGNALWIRE_PHONE_NUMBER` as its one-time database
+fallback. Other tenants must have a `tenant_call_config` row whose `provider`
+is `signalwire` and whose `outbound_number` is the purchased SignalWire DID.
+The existing table stores one provider/number per tenant, so changing a tenant's
+provider changes that tenant's selected outbound route. Restart the relay after
+changing `TELEPHONY_PROVIDER` or server credentials.
 
 ## 한국어
 
@@ -1008,6 +1028,19 @@ _listen_tasks: dict[str, asyncio.Task]         # 세션 리스닝 태스크
 | `guardrail.triggered` | `{level, original}` | Guardrail 이벤트 |
 | `error` | `{message}` | 에러 |
 
+
+
+### SignalWire 발신 통화
+
+`TELEPHONY_PROVIDER=signalwire`로 선택합니다. 기본값은 기존 호환성을 위해
+`twilio`입니다. 위의 `SIGNALWIRE_*` 서버 환경변수를 모두 설정하고 API Token,
+Signing Key, Stream Bearer Secret은 브라우저 환경변수에 절대 노출하지 마세요.
+기본 tenant는 `SIGNALWIRE_PHONE_NUMBER`를 DB 초기 fallback으로 사용할 수 있습니다.
+그 외 tenant는 `tenant_call_config`의 `provider='signalwire'`와 SignalWire
+발신번호(`outbound_number`)를 명시적으로 설정해야 합니다. 기존 테이블은
+tenant마다 provider/번호 한 쌍만 저장하므로 provider를 바꾸면 해당 tenant의
+발신 경로도 바뀝니다. provider 또는 서버 credential 변경 후 relay를 재시작하세요.
+
 ## 환경변수
 
 | 변수 | 기본값 | 설명 |
@@ -1015,6 +1048,13 @@ _listen_tasks: dict[str, asyncio.Task]         # 세션 리스닝 태스크
 | `TWILIO_ACCOUNT_SID` | | Twilio 계정 SID |
 | `TWILIO_AUTH_TOKEN` | | Twilio 인증 토큰 |
 | `TWILIO_PHONE_NUMBER` | | Twilio 발신 번호 |
+| `TELEPHONY_PROVIDER` | `twilio` | PSTN 공급자: `twilio` 또는 `signalwire` |
+| `SIGNALWIRE_SPACE_URL` | | HTTPS SignalWire Space origin |
+| `SIGNALWIRE_PROJECT_ID` | | SignalWire Project ID (UUID) |
+| `SIGNALWIRE_API_TOKEN` | | SignalWire Compatibility API token (서버 전용) |
+| `SIGNALWIRE_PHONE_NUMBER` | | 기본 tenant의 E.164 SignalWire DID |
+| `SIGNALWIRE_SIGNING_KEY` | | Webhook 서명 검증용 Dashboard Signing Key |
+| `SIGNALWIRE_STREAM_TOKEN` | | 별도 생성 bearer secret (ASCII 32자 이상) |
 | `OPENAI_API_KEY` | | OpenAI API 키 |
 | `OPENAI_REALTIME_MODEL` | `gpt-realtime` | Realtime 모델 |
 | `SUPABASE_URL` | | Supabase URL |
