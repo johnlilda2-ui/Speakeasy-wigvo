@@ -31,6 +31,7 @@ def signalwire_config(monkeypatch):
     monkeypatch.setattr(soniox_app, "SIGNALWIRE_PHONE_NUMBER", "+12025550100")
     monkeypatch.setattr(soniox_app, "SIGNALWIRE_SIGNING_KEY", SIGNING_KEY)
     monkeypatch.setattr(soniox_app, "SIGNALWIRE_STREAM_TOKEN", STREAM_TOKEN)
+    monkeypatch.setattr(soniox_app, "WIGVO_CALL_API_TOKEN", "operator-test-token-with-at-least-32-bytes")
     monkeypatch.setattr(soniox_app, "SONIOX_API_KEY", "test-soniox-key")
     soniox_app.SESSIONS.clear()
 
@@ -191,6 +192,7 @@ def test_twilio_remains_the_default_provider(monkeypatch):
     with TestClient(soniox_app.app) as client:
         response = client.post(
             "/api/calls",
+            headers={"Authorization": "Bearer operator-test-token-with-at-least-32-bytes"},
             json={
                 "phone_a": "+12025550101",
                 "phone_b": "+12025550102",
@@ -477,3 +479,41 @@ def test_phone_call_page_clears_old_errors_and_displays_latest_detail():
     assert 'log.textContent="";' in soniox_app.HTML_PAGE
     assert 'add(typeof j.detail==="string"?j.detail:JSON.stringify(j))' in soniox_app.HTML_PAGE
     assert 'statusEl.textContent="Connection error"' in soniox_app.HTML_PAGE
+
+
+def test_private_call_api_rejects_missing_and_invalid_operator_tokens():
+    with TestClient(soniox_app.app) as client:
+        missing = client.post("/api/calls", json={"phone_a": "+12025550101", "phone_b": "+12025550102"})
+        invalid = client.post(
+            "/api/calls",
+            headers={"Authorization": "Bearer wrong-token"},
+            json={"phone_a": "+12025550101", "phone_b": "+12025550102"},
+        )
+    assert missing.status_code == 401
+    assert invalid.status_code == 401
+    assert not soniox_app.SESSIONS
+
+
+def test_private_call_api_fails_closed_when_operator_secret_is_not_configured(monkeypatch):
+    monkeypatch.setattr(soniox_app, "WIGVO_CALL_API_TOKEN", "")
+    with TestClient(soniox_app.app) as client:
+        response = client.post(
+            "/api/calls",
+            headers={"Authorization": "Bearer operator-test-token-with-at-least-32-bytes"},
+            json={"phone_a": "+12025550101", "phone_b": "+12025550102"},
+        )
+    assert response.status_code == 503
+    assert "WIGVO_CALL_API_TOKEN" in response.json()["detail"]
+
+
+def test_private_call_api_accepts_valid_operator_token_without_exposing_it():
+    monkeypatch_token = "operator-test-token-with-at-least-32-bytes"
+    with TestClient(soniox_app.app) as client:
+        response = client.post(
+            "/api/calls",
+            headers={"Authorization": "Bearer " + monkeypatch_token},
+            json={"phone_a": "+12025550101", "phone_b": "+12025550102"},
+        )
+    # Provider setup may be unavailable in this isolated test, but auth must pass first.
+    assert response.status_code != 401
+    assert monkeypatch_token not in response.text
