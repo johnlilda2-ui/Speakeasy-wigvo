@@ -599,24 +599,39 @@ async def start_call(payload: StartCallRequest) -> JSONResponse:
     initiator = initiate_signalwire_call if provider == "signalwire" else initiate_twilio_call
 
     async def start_leg(phone: str, leg_name: str) -> str:
-        sid = await initiator(phone, session_id, leg_name)
-        if not sid:
-            raise RuntimeError(f"{provider} returned an empty call SID for leg {leg_name}")
-        if session.closed:
-            if provider == "signalwire":
-                await asyncio.to_thread(
-                    hangup_signalwire_call,
-                    space_url=SIGNALWIRE_SPACE_URL,
-                    project_id=SIGNALWIRE_PROJECT_ID,
-                    api_token=SIGNALWIRE_API_TOKEN,
-                    call_sid=sid,
-                )
-            else:
-                client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-                await asyncio.to_thread(client.calls(sid).update, status="completed")
-            raise RuntimeError(f"Call session closed while creating leg {leg_name}")
-        session.call_sids[leg_name] = sid
-        return sid
+        try:
+            sid = await initiator(phone, session_id, leg_name)
+            if not sid:
+                raise RuntimeError(f"{provider} returned an empty call SID")
+            if session.closed:
+                if provider == "signalwire":
+                    await asyncio.to_thread(
+                        hangup_signalwire_call,
+                        space_url=SIGNALWIRE_SPACE_URL,
+                        project_id=SIGNALWIRE_PROJECT_ID,
+                        api_token=SIGNALWIRE_API_TOKEN,
+                        call_sid=sid,
+                    )
+                else:
+                    client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+                    await asyncio.to_thread(client.calls(sid).update, status="completed")
+                raise RuntimeError("Call session closed while creating this leg")
+            session.call_sids[leg_name] = sid
+            return sid
+        except Exception as exc:
+            detail = str(exc)
+            for secret in (
+                SIGNALWIRE_API_TOKEN, SIGNALWIRE_SIGNING_KEY, SIGNALWIRE_STREAM_TOKEN,
+                TWILIO_AUTH_TOKEN, phone_a, phone_b,
+            ):
+                if secret:
+                    detail = detail.replace(secret, "[redacted]")
+            detail = re.sub(r"[\\r\\n\\t]+", " ", detail).strip()[:320]
+            log.error(
+                "WIGVO call leg creation failed provider=%s leg=%s error_type=%s detail=%s",
+                provider, leg_name, type(exc).__name__, detail or "no safe detail",
+            )
+            raise RuntimeError(f"Person {leg_name.upper()}: {detail or 'provider request failed'}") from exc
 
     results = await asyncio.gather(
         start_leg(phone_a, "a"),
@@ -627,15 +642,18 @@ async def start_call(payload: StartCallRequest) -> JSONResponse:
     if failures:
         await session.close(reason="call_setup_failed")
         SESSIONS.pop(session_id, None)
+        failure_details = [
+            str(item)[:360] for item in failures
+            if isinstance(item, BaseException)
+        ]
         log.error(
-            "WIGVO call setup failed provider=%s session=%s failed_legs=%d",
-            provider,
-            session_id,
-            len(failures),
+            "WIGVO call setup failed provider=%s session=%s failed_legs=%d details=%s",
+            provider, session_id, len(failures), " | ".join(failure_details),
         )
+        detail = "; ".join(failure_details) or f"{provider} rejected call setup"
         raise HTTPException(
             status_code=502,
-            detail=f"Could not start both {provider} call legs; any created leg was terminated.",
+            detail=f"{detail}. Any call leg already created was terminated.",
         )
 
     return JSONResponse({
@@ -985,7 +1003,9 @@ fetch("/health",{cache:"no-store"}).then(r=>r.json()).then(cfg=>{
   else add("No telephony provider is configured on this service. Add Twilio or SignalWire credentials in Render.");
 }).catch(()=>add("Could not verify telephony provider configuration; call start remains disabled."));
 document.querySelector("#start").onclick=async()=>{
+  log.textContent="";
   statusEl.textContent="Starting…";
+  document.querySelector("#start").disabled=true;
   const body={
     phone_a:document.querySelector("#a").value,
     phone_b:document.querySelector("#b").value,
@@ -993,13 +1013,27 @@ document.querySelector("#start").onclick=async()=>{
     language_b:document.querySelector("#lb").value,
     provider:document.querySelector("#provider").value
   };
-  const r=await fetch("/api/calls",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
-  const j=await r.json();
-  if(!r.ok){statusEl.textContent="Error"; add(JSON.stringify(j)); return}
+  let r,j;
+  try{
+    r=await fetch("/api/calls",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
+    j=await r.json();
+  }catch(error){
+    statusEl.textContent="Connection error";
+    add("Could not reach WIGVO. Check your connection and try again.");
+    document.querySelector("#start").disabled=false;
+    return;
+  }
+  if(!r.ok){
+    statusEl.textContent="Error";
+    add(typeof j.detail==="string"?j.detail:JSON.stringify(j));
+    document.querySelector("#start").disabled=false;
+    return;
+  }
   sid=j.session_id; statusEl.textContent="Calling both participants via "+j.provider+"…"; add("Session "+sid+" provider="+j.provider);
   const proto=location.protocol==="https:"?"wss":"ws";
   const ws=new WebSocket(proto+"://"+location.host+"/api/calls/"+sid+"/events");
   ws.onmessage=e=>{const d=JSON.parse(e.data); add(JSON.stringify(d)); if(d.type==="connected") statusEl.textContent="Participant "+d.leg+" connected"; if(d.type==="call_closed") statusEl.textContent="Call ended"};
+  ws.onclose=()=>{document.querySelector("#start").disabled=false};
 };
 </script>
 </body>
