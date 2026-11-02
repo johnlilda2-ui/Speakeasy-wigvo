@@ -999,7 +999,7 @@ document.querySelector("#start").onclick=async()=>{
   sid=j.session_id; statusEl.textContent="Calling both participants via "+j.provider+"…"; add("Session "+sid+" provider="+j.provider);
   const proto=location.protocol==="https:"?"wss":"ws";
   const ws=new WebSocket(proto+"://"+location.host+"/api/calls/"+sid+"/events");
-  ws.onmessage=e=>{const d=JSON.parse(e.data); add(JSON.stringify(d)); if(d.type==="connected") statusEl.textContent="Participant "+d.leg+" connected"; if(d.type==="call_closed") statusEl.textContent="Call ended"}};
+  ws.onmessage=e=>{const d=JSON.parse(e.data); add(JSON.stringify(d)); if(d.type==="connected") statusEl.textContent="Participant "+d.leg+" connected"; if(d.type==="call_closed") statusEl.textContent="Call ended"};
 };
 </script>
 </body>
