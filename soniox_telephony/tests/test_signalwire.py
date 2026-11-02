@@ -402,7 +402,7 @@ def test_phone_call_page_javascript_parses_with_node():
     node = shutil.which("node")
     if not node:
         pytest.skip("Node.js is not available for inline JavaScript syntax validation")
-    match = re.search(r"<script>([\\s\\S]*?)</script>", soniox_app.HTML_PAGE)
+    match = re.search(r"<script>(.*?)</script>", soniox_app.HTML_PAGE, re.DOTALL)
     assert match is not None
     result = subprocess.run(
         [node, "--check", "-"],
