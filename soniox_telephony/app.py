@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hmac
 import json
 import logging
 import os
@@ -59,6 +60,7 @@ AGORA_APP_CERTIFICATE = os.getenv("AGORA_APP_CERTIFICATE", "").strip()
 AGORA_TOKEN_TTL_S = max(60, min(int(os.getenv("AGORA_TOKEN_TTL_S", "3600")), 86400))
 AGORA_CHANNEL_PREFIX = os.getenv("AGORA_CHANNEL_PREFIX", "speakeasy-").strip() or "speakeasy-"
 MAX_CALL_DURATION_S = max(60, int(os.getenv("MAX_CALL_DURATION_S", "1800")))
+WIGVO_CALL_API_TOKEN = os.getenv("WIGVO_CALL_API_TOKEN", "").strip()
 
 app = FastAPI(title="WIGVO — Realtime Voice Translation", version="0.2.0")
 register_browser_route(app)
@@ -99,6 +101,14 @@ def ensure_configured(provider: str = "twilio") -> None:
             missing.append("TWILIO_PHONE_NUMBER")
     if missing:
         raise RuntimeError("Missing configuration: " + ", ".join(missing))
+
+
+def require_operator_token(authorization: str | None) -> None:
+    if len(WIGVO_CALL_API_TOKEN.encode("utf-8")) < 32:
+        raise HTTPException(status_code=503, detail="Private call access is not configured. Set WIGVO_CALL_API_TOKEN in Render.")
+    scheme, _, supplied = (authorization or "").partition(" ")
+    if scheme.lower() != "bearer" or not supplied or not hmac.compare_digest(supplied, WIGVO_CALL_API_TOKEN):
+        raise HTTPException(status_code=401, detail="Operator access token is missing or invalid.")
 
 
 def validate_e164(value: str) -> str:
@@ -541,6 +551,7 @@ async def health() -> dict[str, Any]:
         "krisp_configured": bool(os.getenv("KRISP_API_KEY", "").strip()),
         "legacy_telephony_soniox_configured": bool(SONIOX_API_KEY),
         "twilio_configured": bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_PHONE_NUMBER),
+        "call_operator_auth_configured": len(WIGVO_CALL_API_TOKEN.encode("utf-8")) >= 32,
         "signalwire_configured": bool(
             SIGNALWIRE_SPACE_URL and SIGNALWIRE_PROJECT_ID and SIGNALWIRE_API_TOKEN
             and SIGNALWIRE_PHONE_NUMBER and SIGNALWIRE_SIGNING_KEY
@@ -565,7 +576,8 @@ async def phone_call_home() -> HTMLResponse:
 
 
 @app.post("/api/calls")
-async def start_call(payload: StartCallRequest) -> JSONResponse:
+async def start_call(payload: StartCallRequest, request: Request) -> JSONResponse:
+    require_operator_token(request.headers.get("authorization"))
     try:
         phone_a = validate_e164(payload.phone_a)
         phone_b = validate_e164(payload.phone_b)
@@ -666,7 +678,8 @@ async def start_call(payload: StartCallRequest) -> JSONResponse:
 
 
 @app.get("/api/calls/{session_id}")
-async def call_status(session_id: str) -> JSONResponse:
+async def call_status(session_id: str, request: Request) -> JSONResponse:
+    require_operator_token(request.headers.get("authorization"))
     session = SESSIONS.get(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Call session not found")
@@ -934,7 +947,14 @@ async def call_events(ws: WebSocket, session_id: str) -> None:
     if not session:
         await ws.close(code=4404)
         return
-    await ws.accept()
+    protocols = ws.headers.get("sec-websocket-protocol", "").split(",")
+    supplied_token = protocols[1].strip() if len(protocols) > 1 and protocols[0].strip() == "wigvo-auth" else ""
+    try:
+        require_operator_token("Bearer " + supplied_token)
+    except HTTPException:
+        await ws.close(code=4401)
+        return
+    await ws.accept(subprotocol="wigvo-auth")
     session.dashboard_ws = ws
     try:
         await session.send_event({
@@ -980,6 +1000,9 @@ small{color:#9eabca}
 <div><label>Language A</label><input id="la" value="en"></div>
 <div><label>Language B</label><input id="lb" value="pt"></div>
 </div>
+<label for="operator-token">Private operator access token</label>
+<input id="operator-token" type="password" autocomplete="off" placeholder="Enter Render WIGVO_CALL_API_TOKEN">
+<small>Token is held only in this page while it remains open. Do not share it.</small>
 <label for="provider">Telephony provider</label>
 <select id="provider"><option value="twilio">Twilio</option><option value="signalwire">SignalWire</option></select>
 <button id="start" disabled>Start translated call</button>
@@ -991,6 +1014,7 @@ small{color:#9eabca}
 </div>
 <script>
 let sid="";
+let operatorToken="";
 const statusEl=document.querySelector("#status"),log=document.querySelector("#log");
 function add(x){log.textContent += x+"\\n"; log.scrollTop=log.scrollHeight}
 fetch("/health",{cache:"no-store"}).then(r=>r.json()).then(cfg=>{
@@ -999,11 +1023,14 @@ fetch("/health",{cache:"no-store"}).then(r=>r.json()).then(cfg=>{
   if(twilioOption)twilioOption.disabled=!cfg.twilio_configured;
   if(signalwireOption)signalwireOption.disabled=!cfg.signalwire_configured;
   if(!cfg.twilio_configured&&cfg.signalwire_configured)document.querySelector("#provider").value="signalwire";
-  if(cfg.twilio_configured||cfg.signalwire_configured)document.querySelector("#start").disabled=false;
+  if(cfg.call_operator_auth_configured&&(cfg.twilio_configured||cfg.signalwire_configured))document.querySelector("#start").disabled=false;
+  else if(!cfg.call_operator_auth_configured)add("Private operator access is not configured. Set WIGVO_CALL_API_TOKEN in Render (minimum 32 characters).");
   else add("No telephony provider is configured on this service. Add Twilio or SignalWire credentials in Render.");
 }).catch(()=>add("Could not verify telephony provider configuration; call start remains disabled."));
 document.querySelector("#start").onclick=async()=>{
   log.textContent="";
+  operatorToken=document.querySelector("#operator-token").value.trim();
+  if(operatorToken.length<32){add("Enter the private operator token (at least 32 characters).");return;}
   statusEl.textContent="Starting…";
   document.querySelector("#start").disabled=true;
   const body={
@@ -1015,7 +1042,7 @@ document.querySelector("#start").onclick=async()=>{
   };
   let r,j;
   try{
-    r=await fetch("/api/calls",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
+    r=await fetch("/api/calls",{method:"POST",headers:{"content-type":"application/json","authorization":"Bearer "+operatorToken},body:JSON.stringify(body)});
     j=await r.json();
   }catch(error){
     statusEl.textContent="Connection error";
@@ -1031,7 +1058,7 @@ document.querySelector("#start").onclick=async()=>{
   }
   sid=j.session_id; statusEl.textContent="Calling both participants via "+j.provider+"…"; add("Session "+sid+" provider="+j.provider);
   const proto=location.protocol==="https:"?"wss":"ws";
-  const ws=new WebSocket(proto+"://"+location.host+"/api/calls/"+sid+"/events");
+  const ws=new WebSocket(proto+"://"+location.host+"/api/calls/"+sid+"/events",["wigvo-auth",operatorToken]);
   ws.onmessage=e=>{const d=JSON.parse(e.data); add(JSON.stringify(d)); if(d.type==="connected") statusEl.textContent="Participant "+d.leg+" connected"; if(d.type==="call_closed") statusEl.textContent="Call ended"};
   ws.onclose=()=>{document.querySelector("#start").disabled=false};
 };
