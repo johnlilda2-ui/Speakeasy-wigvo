@@ -282,6 +282,8 @@ def test_phone_call_page_exposes_provider_selector_without_replacing_root_demo()
     assert 'document.querySelector("#provider").value="signalwire"' in response.text
     assert 'document.querySelector("#start").disabled=false' in response.text
     assert 'provider:document.querySelector("#provider").value' in response.text
+    assert 'statusEl.textContent="Call ended"};' in response.text
+    assert 'statusEl.textContent="Call ended"}};' not in response.text
 
 
 def test_signalwire_create_call_uses_compatibility_api(monkeypatch):
