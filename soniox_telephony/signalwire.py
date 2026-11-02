@@ -82,8 +82,38 @@ def _api_request(
         with urlopen(request, timeout=HTTP_TIMEOUT_S) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except HTTPError as exc:
-        logger.error("SignalWire API rejected request endpoint=%s status=%s", path, exc.code)
-        raise RuntimeError(f"SignalWire API rejected the request (HTTP {exc.code})") from exc
+        raw_error = exc.read(16384).decode("utf-8", errors="replace")
+        message = ""
+        provider_code = ""
+        try:
+            error_payload = json.loads(raw_error)
+        except json.JSONDecodeError:
+            error_payload = {}
+        if isinstance(error_payload, dict):
+            message = str(
+                error_payload.get("message")
+                or error_payload.get("error_message")
+                or error_payload.get("error")
+                or ""
+            )
+            provider_code = str(error_payload.get("code") or error_payload.get("error_code") or "")
+        # Never echo credentials or arbitrary provider response fields to logs/UI.
+        for secret in (api_token, project_id):
+            if secret:
+                message = message.replace(secret, "[redacted]")
+        message = re.sub(r"[\\r\\n\\t]+", " ", message).strip()[:240]
+        provider_code = re.sub(r"[^A-Za-z0-9_.-]", "", provider_code)[:40]
+        logger.error(
+            "SignalWire API rejected request endpoint=%s status=%s provider_code=%s message=%s",
+            path, exc.code, provider_code or "unavailable", message or "no safe message returned",
+        )
+        detail = f"SignalWire API rejected the request (HTTP {exc.code}"
+        if provider_code:
+            detail += f", code {provider_code}"
+        detail += ")"
+        if message:
+            detail += f": {message}"
+        raise RuntimeError(detail) from exc
     except (URLError, TimeoutError, OSError) as exc:
         logger.error("SignalWire API connection failed endpoint=%s error_type=%s", path, type(exc).__name__)
         raise RuntimeError("Could not connect to SignalWire API") from exc
