@@ -101,6 +101,7 @@ def _api_request(
         for secret in (api_token, project_id):
             if secret:
                 message = message.replace(secret, "[redacted]")
+        message = re.sub(r"\\+?[0-9][0-9 ()-]{6,}[0-9]", "[redacted number]", message)
         message = re.sub(r"[\\r\\n\\t]+", " ", message).strip()[:240]
         provider_code = re.sub(r"[^A-Za-z0-9_.-]", "", provider_code)[:40]
         logger.error(
