@@ -215,6 +215,7 @@ def test_signalwire_provider_selection_uses_signalwire_dialer(monkeypatch):
     with TestClient(soniox_app.app) as client:
         response = client.post(
             "/api/calls",
+            headers={"Authorization": "Bearer operator-test-token-with-at-least-32-bytes"},
             json={
                 "phone_a": "+12025550101",
                 "phone_b": "+12025550102",
