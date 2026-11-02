@@ -412,3 +412,68 @@ def test_phone_call_page_javascript_parses_with_node():
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_signalwire_http_error_exposes_safe_provider_message(monkeypatch):
+    import io
+    import signalwire
+    from urllib.error import HTTPError
+
+    def rejected_request(_request, timeout):
+        raise HTTPError(
+            "https://wigvo.signalwire.com/api/Calls",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"message":"The From number is not authorized","code":21212}'),
+        )
+
+    monkeypatch.setattr(signalwire, "urlopen", rejected_request)
+    with pytest.raises(RuntimeError) as error:
+        signalwire.create_call(
+            space_url="https://wigvo.signalwire.com",
+            project_id="00000000-0000-4000-8000-000000000001",
+            api_token="test-api-token",
+            phone="+12025550101",
+            from_number="+12025550100",
+            public_base_url=PUBLIC_BASE,
+            session_id="session-test-123",
+            leg="a",
+        )
+    assert "HTTP 400" in str(error.value)
+    assert "21212" in str(error.value)
+    assert "From number is not authorized" in str(error.value)
+    assert "test-api-token" not in str(error.value)
+
+
+def test_call_setup_error_identifies_failed_signalwire_leg(monkeypatch):
+    async def fail_person_b(phone, session_id, leg):
+        if leg == "b":
+            raise RuntimeError("SignalWire API rejected the request (HTTP 400, code 21212): caller ID not authorized")
+        return "SW-created-leg-a"
+
+    monkeypatch.setattr(soniox_app, "initiate_signalwire_call", fail_person_b)
+    monkeypatch.setattr(soniox_app, "hangup_signalwire_call", MagicMock())
+    with TestClient(soniox_app.app) as client:
+        response = client.post(
+            "/api/calls",
+            json={
+                "phone_a": "+12025550101",
+                "phone_b": "+12025550102",
+                "language_a": "en",
+                "language_b": "pt",
+                "provider": "signalwire",
+            },
+        )
+    assert response.status_code == 502
+    assert "Person B" in response.json()["detail"]
+    assert "HTTP 400" in response.json()["detail"]
+    assert "caller ID not authorized" in response.json()["detail"]
+    assert "Any call leg already created was terminated" in response.json()["detail"]
+    assert not soniox_app.SESSIONS
+
+
+def test_phone_call_page_clears_old_errors_and_displays_latest_detail():
+    assert 'log.textContent="";' in soniox_app.HTML_PAGE
+    assert 'add(typeof j.detail==="string"?j.detail:JSON.stringify(j))' in soniox_app.HTML_PAGE
+    assert 'statusEl.textContent="Connection error"' in soniox_app.HTML_PAGE
