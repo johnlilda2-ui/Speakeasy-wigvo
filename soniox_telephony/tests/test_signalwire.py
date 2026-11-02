@@ -392,3 +392,23 @@ def test_signalwire_stream_accepts_bearer_and_normalizes_nested_start(monkeypatc
     assert session.legs["a"].stream_sid == "SW-stream-a"
     assert session.legs["a"].call_sid == "SW-call-a"
     assert session.session_id not in soniox_app.SESSIONS
+
+
+def test_phone_call_page_javascript_parses_with_node():
+    import re
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is not available for inline JavaScript syntax validation")
+    match = re.search(r"<script>([\\s\\S]*?)</script>", soniox_app.HTML_PAGE)
+    assert match is not None
+    result = subprocess.run(
+        [node, "--check", "-"],
+        input=match.group(1),
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
