@@ -1,0 +1,47 @@
+name: OpenVoiceChanger CPU benchmark
+
+on:
+  push:
+    branches:
+      - bench/openvoicechanger-cpu
+  pull_request:
+    branches:
+      - feature/soniox-telephony-core
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-rvc-benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout benchmark branch
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Show runner resources
+        run: |
+          echo "Python:"
+          python --version
+          echo "CPU:"
+          nproc
+          echo "Memory:"
+          free -h
+          echo "Disk:"
+          df -h /
+
+      - name: Install system build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential git ffmpeg
+
+      - name: Run OpenVoiceChanger RVC CPU benchmark
+        run: |
+          python bench/openvoicechanger_cpu.py
