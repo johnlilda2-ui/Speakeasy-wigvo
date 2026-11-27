@@ -1,7 +1,7 @@
 import asyncio
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import patch, AsyncMock
 import sys
 from pathlib import Path
 
@@ -80,7 +80,7 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
         for fmt in ("pcm_s16le", "opus"):
             with self.subTest(fmt=fmt):
                 client, upstream = Client(fmt), Upstream(fmt)
-                with patch.object(b, "KRISP_API_KEY", "fake"), patch.object(b, "_create_session_token", return_value="fake"), patch.object(b.websockets, "connect", return_value=upstream):
+                with patch.object(b, "KRISP_API_KEY", "fake"), patch.object(b, "_create_session_token", return_value="fake"), patch.object(b.websockets, "connect", new=AsyncMock(return_value=upstream)):
                     await asyncio.wait_for(b.browser_translation(client), 3)
                 self.assertEqual(json.loads(upstream.sent[0])["config"]["audio"]["format"], fmt)
                 self.assertEqual(client.events[0]["type"], "ready")
