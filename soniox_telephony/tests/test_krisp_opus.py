@@ -102,3 +102,57 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(b.browser_translation(client), 3)
         token.assert_not_called()
         self.assertTrue(any(isinstance(e, dict) and e.get("type") == "error" for e in client.events))
+
+
+    async def test_abandoned_both_directions_close_without_disconnect(self):
+        class Abandoned(Client):
+            async def receive(self):
+                await asyncio.Future()
+        for fmt in ("pcm_s16le", "opus"):
+            client, upstream = Abandoned(fmt), Upstream(fmt)
+            upstream.close = AsyncMock()
+            client.close = AsyncMock()
+            with patch.object(b, "AUDIO_IDLE_TIMEOUT_SECONDS", .05), patch.object(b, "KRISP_API_KEY", "fake"), patch.object(b, "_create_session_token", return_value="fake"), patch.object(b.websockets, "connect", new=AsyncMock(return_value=upstream)):
+                await asyncio.wait_for(b.browser_translation(client), 1)
+            upstream.close.assert_awaited_once()
+            client.close.assert_awaited_once()
+
+    async def test_silent_frames_keep_session_alive(self):
+        class Silent(Client):
+            count = 0
+            async def receive(self):
+                if self.count == 10:
+                    return {"type": "websocket.disconnect"}
+                await asyncio.sleep(.015)
+                self.count += 1
+                return {"bytes": bytes(640)}
+        client, upstream = Silent("pcm_s16le"), Upstream("pcm_s16le")
+        upstream.close = AsyncMock()
+        with patch.object(b, "AUDIO_IDLE_TIMEOUT_SECONDS", .06), patch.object(b, "KRISP_API_KEY", "fake"), patch.object(b, "_create_session_token", return_value="fake"), patch.object(b.websockets, "connect", new=AsyncMock(return_value=upstream)):
+            await asyncio.wait_for(b.browser_translation(client), 2)
+        self.assertEqual(client.count, 10)
+        self.assertEqual(len([p for p in upstream.sent if isinstance(p, bytes)]), 10)
+        upstream.close.assert_awaited_once()
+
+    async def test_control_messages_cannot_keep_abandoned_session_alive(self):
+        class Controls(Client):
+            async def receive(self):
+                await asyncio.sleep(.01)
+                return {"text": '{"type":"ping"}'}
+        client, upstream = Controls("opus"), Upstream("opus")
+        upstream.close = AsyncMock()
+        with patch.object(b, "AUDIO_IDLE_TIMEOUT_SECONDS", .05), patch.object(b, "KRISP_API_KEY", "fake"), patch.object(b, "_create_session_token", return_value="fake"), patch.object(b.websockets, "connect", new=AsyncMock(return_value=upstream)):
+            await asyncio.wait_for(b.browser_translation(client), 1)
+        upstream.close.assert_awaited_once()
+
+    async def test_watchdog_closes_stalled_upstream_send(self):
+        class Stalled(Upstream):
+            async def send(self, data):
+                if isinstance(data, bytes):
+                    await asyncio.Future()
+                await super().send(data)
+        client, upstream = Client("opus"), Stalled("opus")
+        upstream.close = AsyncMock()
+        with patch.object(b, "AUDIO_IDLE_TIMEOUT_SECONDS", .05), patch.object(b, "KRISP_API_KEY", "fake"), patch.object(b, "_create_session_token", return_value="fake"), patch.object(b.websockets, "connect", new=AsyncMock(return_value=upstream)):
+            await asyncio.wait_for(b.browser_translation(client), 1)
+        upstream.close.assert_awaited_once()
