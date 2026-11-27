@@ -14,7 +14,7 @@ class PacketTests(unittest.TestCase):
         self.assertEqual(b.opus_packet_duration_ms(bytes([0x78, 0])), 20)
         self.assertEqual(b.opus_packet_duration_ms(bytes([0xF8, 0])), 20)
         self.assertEqual(b.opus_packet_duration_ms(bytes([0xF9, 0, 0])), 40)
-        for invalid in (b"", b"\\x03", b"\\xfb\\x3f"):
+        for invalid in (b'', bytes([3]), bytes([0xfb, 0x3f])):
             with self.assertRaises(ValueError):
                 b.opus_packet_duration_ms(invalid)
 
@@ -30,10 +30,12 @@ class PacketTests(unittest.TestCase):
 class Client:
     def __init__(self, fmt):
         self.fmt = fmt
+        self.headers = {'sec-websocket-protocol': 'wigvo.opus.v1'} if fmt == 'opus' else {}
+        self.selected = None
         self.events = []
         self.first = True
         self.output = asyncio.Event()
-    async def accept(self): pass
+    async def accept(self, subprotocol=None): self.selected = subprotocol
     async def close(self, **kwargs): pass
     async def receive_json(self):
         return {"source_language": "en-US", "target_language": "pt-BR",
@@ -83,6 +85,7 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(b, "KRISP_API_KEY", "fake"), patch.object(b, "_create_session_token", return_value="fake"), patch.object(b.websockets, "connect", new=AsyncMock(return_value=upstream)):
                     await asyncio.wait_for(b.browser_translation(client), 3)
                 self.assertEqual(json.loads(upstream.sent[0])["config"]["audio"]["format"], fmt)
+                self.assertEqual(client.selected, "wigvo.opus.v1" if fmt == "opus" else None)
                 self.assertEqual(client.events[0]["type"], "ready")
                 self.assertEqual(client.events[0]["audio_format"], fmt)
                 if fmt == "opus":
