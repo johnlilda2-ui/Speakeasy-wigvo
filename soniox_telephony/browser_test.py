@@ -205,7 +205,11 @@ def next_audio_deadline(previous: float, started: float, duration: float) -> flo
 
 
 async def browser_translation(ws: WebSocket) -> None:
-    await ws.accept()
+    offered = getattr(ws, "headers", {}).get("sec-websocket-protocol", "")
+    if "wigvo.opus.v1" in {p.strip() for p in offered.split(",")}:
+        await ws.accept(subprotocol="wigvo.opus.v1")
+    else:
+        await ws.accept()
     if not KRISP_API_KEY:
         await ws.send_json({"type": "error", "stage": "config", "message": "KRISP_API_KEY is not configured on Render."})
         await ws.close(code=1011)
