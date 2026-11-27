@@ -1,7 +1,7 @@
 name: Krisp Opus transport checks
 on:
   push:
-    branches: [feature/krisp-opus-latency-2026-11-27]
+    branches: [feature/krisp-opus-latency-2026-11-27, fix/krisp-inactivity-watchdog-2026-11-27, feature/soniox-telephony-core]
   workflow_dispatch:
 jobs:
   test:
