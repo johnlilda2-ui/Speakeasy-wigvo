@@ -204,6 +204,9 @@ def next_audio_deadline(previous: float, started: float, duration: float) -> flo
     return max(previous + duration, started + max(0, duration - 0.005))
 
 
+AUDIO_IDLE_TIMEOUT_SECONDS = 15.0
+
+
 async def browser_translation(ws: WebSocket) -> None:
     offered = getattr(ws, "headers", {}).get("sec-websocket-protocol", "")
     opus_negotiated = "wigvo.opus.v1" in {p.strip() for p in offered.split(",")}
@@ -389,8 +392,19 @@ async def browser_translation(ws: WebSocket) -> None:
             elapsed_ms(timing_marks.get("upstream_ready_received")),
         )
 
+        last_valid_audio_at = time.monotonic()
+
+        async def audio_watchdog() -> None:
+            # Independent of input receive, upstream send, output and control messages.
+            while True:
+                remaining = AUDIO_IDLE_TIMEOUT_SECONDS - (time.monotonic() - last_valid_audio_at)
+                if remaining <= 0:
+                    logger.warning("Krisp audio inactivity timeout session=%s seconds=%.1f", session_tag, AUDIO_IDLE_TIMEOUT_SECONDS)
+                    return
+                await asyncio.sleep(remaining)
+
         async def forward_input() -> None:
-            nonlocal input_send_seq, next_upstream_audio_at
+            nonlocal input_send_seq, next_upstream_audio_at, last_valid_audio_at
             while True:
                 msg = await ws.receive()
                 if msg.get("type") == "websocket.disconnect":
@@ -411,6 +425,8 @@ async def browser_translation(ws: WebSocket) -> None:
                             if len(audio) % 2:
                                 raise RuntimeError("Incomplete PCM16 sample.")
                             frame_duration_s = len(audio) / 32000.0
+                        # Valid silent PCM/Opus packets count as activity; text/pings do not.
+                        last_valid_audio_at = received_at
                         now = time.monotonic()
                         if next_upstream_audio_at > now:
                             await asyncio.sleep(next_upstream_audio_at - now)
@@ -635,7 +651,8 @@ async def browser_translation(ws: WebSocket) -> None:
                     item = event["translate"]
                     await ws.send_json({"type": "translate", "text": item.get("text", ""), "final": bool(item.get("final"))})
 
-        tasks = [asyncio.create_task(forward_input()), asyncio.create_task(forward_output())]
+        tasks = [asyncio.create_task(forward_input()), asyncio.create_task(forward_output()),
+                 asyncio.create_task(audio_watchdog())]
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in pending:
             task.cancel()
@@ -717,9 +734,13 @@ async def browser_translation(ws: WebSocket) -> None:
             await asyncio.gather(*tasks, return_exceptions=True)
         if upstream:
             try:
-                await upstream.close()
-            except Exception:
-                pass
+                await asyncio.wait_for(upstream.close(), timeout=6)
+                logger.info("Krisp upstream closed session=%s", session_tag)
+            except Exception as exc:
+                logger.warning("Krisp upstream close unconfirmed session=%s error=%s", session_tag, type(exc).__name__)
+                transport = getattr(upstream, "transport", None)
+                if transport is not None:
+                    transport.abort()
         try:
             await ws.close()
         except Exception:
