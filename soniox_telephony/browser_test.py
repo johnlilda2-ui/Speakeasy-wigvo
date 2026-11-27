@@ -206,7 +206,8 @@ def next_audio_deadline(previous: float, started: float, duration: float) -> flo
 
 async def browser_translation(ws: WebSocket) -> None:
     offered = getattr(ws, "headers", {}).get("sec-websocket-protocol", "")
-    if "wigvo.opus.v1" in {p.strip() for p in offered.split(",")}:
+    opus_negotiated = "wigvo.opus.v1" in {p.strip() for p in offered.split(",")}
+    if opus_negotiated:
         await ws.accept(subprotocol="wigvo.opus.v1")
     else:
         await ws.accept()
@@ -311,7 +312,9 @@ async def browser_translation(ws: WebSocket) -> None:
         return value
 
     try:
-        cfg = await ws.receive_json()
+        cfg = await asyncio.wait_for(ws.receive_json(), timeout=15)
+        if not isinstance(cfg, dict):
+            raise RuntimeError("Translation configuration must be a JSON object.")
         mark_timing("browser_config_received")
         source = str(cfg.get("source_language") or "en-US")
         target = str(cfg.get("target_language") or ("pt-BR" if source == "en-US" else "en-US"))
@@ -328,6 +331,8 @@ async def browser_translation(ws: WebSocket) -> None:
         audio_format = cfg.get("audio_format", "pcm_s16le")
         if audio_format not in ("pcm_s16le", "opus"):
             raise RuntimeError("Unsupported audio format; choose pcm_s16le or opus.")
+        if (audio_format == "opus") != opus_negotiated:
+            raise RuntimeError("Requested codec does not match the negotiated WebSocket protocol.")
         voice = str(cfg.get("voice") or "female").lower()
         if voice not in {"male", "female"}:
             voice = "female"
