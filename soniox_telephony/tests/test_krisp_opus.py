@@ -93,3 +93,12 @@ class RelayTests(unittest.IsolatedAsyncioTestCase):
                 else:
                     self.assertEqual(client.events[1]["type"], "audio")
                     self.assertEqual(client.events[1]["sample_rate"], 16000)
+
+
+    async def test_codec_mismatch_rejected_before_token_creation(self):
+        client = Client("opus")
+        client.headers = {}
+        with patch.object(b, "KRISP_API_KEY", "fake"), patch.object(b, "_create_session_token") as token:
+            await asyncio.wait_for(b.browser_translation(client), 3)
+        token.assert_not_called()
+        self.assertTrue(any(isinstance(e, dict) and e.get("type") == "error" for e in client.events))
