@@ -181,6 +181,29 @@ def _get_supported_languages() -> set[str]:
         raise RuntimeError("Krisp returned no supported language codes.")
     return codes
 
+def opus_packet_duration_ms(packet: bytes) -> float:
+    """RFC 6716 TOC duration, without decoding or trusting a client timestamp."""
+    if not packet or len(packet) > 4096:
+        raise ValueError("Invalid Opus packet size.")
+    config = packet[0] >> 3
+    if config < 12:
+        duration = (10, 20, 40, 60)[config % 4]
+    elif config < 16:
+        duration = (10, 20)[config % 2]
+    else:
+        duration = (2.5, 5, 10, 20)[config % 4]
+    code = packet[0] & 3
+    frames = 1 if code == 0 else 2 if code in (1, 2) else (packet[1] & 63 if len(packet) >= 2 else 0)
+    if not 1 <= frames <= 48 or duration * frames > 120:
+        raise ValueError("Invalid Opus packet duration.")
+    return duration * frames
+
+
+def next_audio_deadline(previous: float, started: float, duration: float) -> float:
+    """Pace at the audio clock, not send-completion time; bound catch-up to 5 ms."""
+    return max(previous + duration, started + max(0, duration - 0.005))
+
+
 async def browser_translation(ws: WebSocket) -> None:
     await ws.accept()
     if not KRISP_API_KEY:
@@ -298,6 +321,9 @@ async def browser_translation(ws: WebSocket) -> None:
         # for this informational endpoint even when session-token/VT access works.
         # The VT session handshake validates the actual language pair and returns
         # a structured validation error if Krisp cannot use it.
+        audio_format = cfg.get("audio_format", "pcm_s16le")
+        if audio_format not in ("pcm_s16le", "opus"):
+            raise RuntimeError("Unsupported audio format; choose pcm_s16le or opus.")
         voice = str(cfg.get("voice") or "female").lower()
         if voice not in {"male", "female"}:
             voice = "female"
@@ -313,7 +339,7 @@ async def browser_translation(ws: WebSocket) -> None:
         mark_timing("upstream_connected")
         mark_timing("upstream_config_send_started")
         await upstream.send(json.dumps({"config": {
-            "audio": {"format": "pcm_s16le", "sample_rate": 16000, "channels": 1},
+            "audio": {"format": audio_format, "sample_rate": 16000, "channels": 1},
             "source_language": source, "target_language": target, "voice": voice,
             "features": {"background_voice_cancellation": False},
             "transcript": {"interim": True, "final": True, "translate": True},
@@ -340,7 +366,7 @@ async def browser_translation(ws: WebSocket) -> None:
                 "code": error.get("code") or hello.get("error_code")})
             return
         await ws.send_json({"type": "ready", "provider": "krisp",
-                            "source_language": source, "target_language": target, "sample_rate": 16000})
+                            "source_language": source, "target_language": target, "sample_rate": 16000, "audio_format": audio_format})
         mark_timing("browser_ready_sent")
         logger.info(
             "Krisp browser stage timings session=%s session_to_config_ms=%s token_request_ms=%s "
@@ -368,7 +394,14 @@ async def browser_translation(ws: WebSocket) -> None:
                     if len(audio) <= 65536:
                         # Krisp VT expects input audio paced in real time. Browser audio callbacks
                         # can arrive in bursts; preserve each PCM frame's duration at the upstream boundary.
-                        frame_duration_s = len(audio) / 32000.0  # 16 kHz * mono * 16-bit PCM
+                        if audio_format == "opus":
+                            if opus_packet_duration_ms(audio) != 20:
+                                raise RuntimeError("Opus input must contain exactly 20 ms per packet.")
+                            frame_duration_s = 0.020
+                        else:
+                            if len(audio) % 2:
+                                raise RuntimeError("Incomplete PCM16 sample.")
+                            frame_duration_s = len(audio) / 32000.0
                         now = time.monotonic()
                         if next_upstream_audio_at > now:
                             await asyncio.sleep(next_upstream_audio_at - now)
@@ -380,7 +413,7 @@ async def browser_translation(ws: WebSocket) -> None:
                             await upstream.send(audio)
                         finally:
                             send_completed_at = time.monotonic()
-                            next_upstream_audio_at = max(send_started_at, send_completed_at) + frame_duration_s
+                            next_upstream_audio_at = next_audio_deadline(next_upstream_audio_at, send_started_at, frame_duration_s)
                             if metrics["first_krisp_send_completed_at"] is None:
                                 metrics["first_krisp_send_completed_at"] = send_completed_at
                                 mark_timing("first_krisp_send_completed", send_completed_at)
@@ -511,7 +544,11 @@ async def browser_translation(ws: WebSocket) -> None:
                         f"O{output_recv_seq}[r={elapsed_ms(output_received_at)},b={len(raw)}]"
                     )
                     browser_send_started_at = time.monotonic()
-                    await ws.send_json({"type": "audio", "seq": output_recv_seq, "audio": base64.b64encode(raw).decode("ascii"), "sample_rate": 16000})
+                    if audio_format == "opus":
+                        opus_packet_duration_ms(raw)
+                        await ws.send_bytes(raw)
+                    else:
+                        await ws.send_json({"type": "audio", "seq": output_recv_seq, "audio": base64.b64encode(raw).decode("ascii"), "sample_rate": 16000})
                     browser_send_completed_at = time.monotonic()
                     if metrics["first_output_forwarded_at"] is None:
                         metrics["first_output_forwarded_at"] = browser_send_completed_at
@@ -866,4 +903,5 @@ def register_browser_home(app: Any) -> None:
             "agora_sdk_version": AGORA_SDK_VERSION,
             "agora_channel_prefix": AGORA_CHANNEL_PREFIX,
             "krisp_configured": bool(KRISP_API_KEY),
+            "krisp_audio_formats": ["pcm_s16le", "opus"],
         }, headers=headers)
